@@ -1,0 +1,8 @@
+# Local database (session history, saved API key)
+vdev.sqlite
+vdev.sqlite-*
+
+# Browser automation output
+.playwright-mcp/
+
+.DS_Store
