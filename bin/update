@@ -41,5 +41,7 @@ team_config_backup=""
 
 bin/install
 
+# bin/server runs this itself before starting, so the restart hint is only for manual runs.
+[ "${1:-}" = "--from-server" ] && exit 0
 echo
 info "Updated. If vdev is running, stop it (Ctrl+C in its terminal) and start it again with bin/server."

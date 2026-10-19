@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
-# Starts the vdev server. Set VDEV_PORT or VDEV_DATABASE to override team.json defaults.
+# Updates vdev to the latest version, then starts the server.
+# Set VDEV_SKIP_UPDATE=1 to start without updating; VDEV_PORT or VDEV_DATABASE override team.json defaults.
 set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# The update may replace this script, so start again on the new copy without updating twice.
+if [ "${VDEV_SKIP_UPDATE:-}" != "1" ]; then
+  if ! bin/update --from-server; then
+    printf 'Warning: could not update vdev; starting the current version.\n' >&2
+  fi
+  VDEV_SKIP_UPDATE=1 exec bin/server "$@"
+fi
 
 export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
 
@@ -19,6 +30,5 @@ if ! claude auth status 2> /dev/null | grep -q '"loggedIn": *true'; then
   exit 1
 fi
 
-cd "$(dirname "$0")/.."
 [ -f team.json ] || cp team.example.json team.json
 exec bun server.ts "$@"
