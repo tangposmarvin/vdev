@@ -51,5 +51,7 @@ else
   cp team.example.json team.json
 fi
 
+# bin/update runs this after every pull; the next step is only news on a first install.
+[ "${1:-}" = "--from-update" ] && exit 0
 echo
 info "Done. Start vdev with: bin/server"

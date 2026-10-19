@@ -39,7 +39,7 @@ git pull --ff-only
 restore_team_config
 team_config_backup=""
 
-bin/install
+bin/install --from-update
 
 # bin/server runs this itself before starting, so the restart hint is only for manual runs.
 [ "${1:-}" = "--from-server" ] && exit 0
