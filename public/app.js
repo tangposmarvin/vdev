@@ -102,6 +102,7 @@ const elements = {
   closeSettingsButton: document.querySelector(".js-close-settings"),
   addWorkerButton: document.querySelector(".js-add-worker"),
   teamHint: document.querySelector(".js-team-hint"),
+  chooseFolderButton: document.querySelector(".js-choose-folder"),
   allowAllPermissionsButton: document.querySelector(".js-allow-all-permissions"),
 };
 
@@ -263,6 +264,9 @@ function handleServerMessage(message) {
       elements.workspaceError.textContent = message.message;
       elements.workspaceError.hidden = false;
       break;
+    case "folderPicker":
+      renderFolderPicker(message.open);
+      break;
   }
 }
 
@@ -292,8 +296,16 @@ function renderWorkspace() {
   // Members belong to a workspace, so there is no team to show or add to yet.
   elements.addWorkerButton.hidden = !workspace.workspace;
   elements.teamHint.hidden = Boolean(workspace.workspace);
+  elements.chooseFolderButton.hidden = !workspace.folderPicker;
+  renderFolderPicker(workspace.folderPickerOpen);
   renderWorkspaceGroup(elements.workspaceRecent, "Recent", workspace.recentWorkspaces);
   renderWorkspaceGroup(elements.workspaceCandidates, "Repositories", workspace.candidateWorkspaces);
+}
+
+// The dialog opens on the computer running vdev, not in the page.
+function renderFolderPicker(open) {
+  elements.chooseFolderButton.disabled = Boolean(open);
+  elements.chooseFolderButton.textContent = open ? "Waiting for your choice..." : "Choose folder...";
 }
 
 function renderWorkspaceGroup(container, title, paths) {
@@ -1900,6 +1912,11 @@ elements.activeWorkspaces.addEventListener("click", (clickEvent) => {
   }
   const option = clickEvent.target.closest(".js-workspace-option");
   if (option) openWorkspace(option.dataset.path);
+});
+
+elements.chooseFolderButton.addEventListener("click", () => {
+  elements.workspaceError.hidden = true;
+  send({ type: "chooseFolder" });
 });
 
 elements.workspaceForm.addEventListener("submit", (submitEvent) => {

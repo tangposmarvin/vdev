@@ -513,6 +513,7 @@ button { font: inherit; color: inherit; }
 .workspace-option-path { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11px; }
 
 .workspace-form { display: flex; gap: 6px; margin: 8px 0 4px; }
+.workspace-choose { width: 100%; margin-bottom: 8px; }
 
 .workspace-input {
   flex: 1;

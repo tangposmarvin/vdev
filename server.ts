@@ -2608,6 +2608,8 @@ function snapshot() {
     workspaceName: projectDirectory ? basename(projectDirectory) : null,
     recentWorkspaces: recent,
     candidateWorkspaces: candidateWorkspaces().filter((path) => !recent.includes(path)),
+    folderPicker: folderPicker !== null,
+    folderPickerOpen,
     activeWorkspaces: activeWorkspaces(),
     projectSettings: team ? projectSettingsFor(team) : null,
     teamSettings: teamSettings(),
@@ -2634,6 +2636,37 @@ function switchWorkspace(socket: ServerWebSocket<unknown>, requestedPath: string
   const recent = [nextWorkspace, ...recentWorkspaces().filter((path) => path !== nextWorkspace)];
   queries.writeSetting.run("recent_workspaces", JSON.stringify(recent.slice(0, RECENT_WORKSPACE_LIMIT)));
   broadcast(snapshot());
+}
+
+// A native folder dialog. vdev only listens on 127.0.0.1, so it opens on the same
+// machine as the browser. macOS always has osascript; Linux needs zenity or kdialog.
+function folderPickerCommand(): string[] | null {
+  const prompt = "Choose a project folder for your team";
+  if (process.platform === "darwin") {
+    return ["osascript", "-e", `POSIX path of (choose folder with prompt "${prompt}" default location (path to documents folder))`];
+  }
+  if (Bun.which("zenity")) return ["zenity", "--file-selection", "--directory", `--title=${prompt}`];
+  if (Bun.which("kdialog")) return ["kdialog", "--getexistingdirectory", homedir(), "--title", prompt];
+  return null;
+}
+
+const folderPicker = folderPickerCommand();
+let folderPickerOpen = false;
+
+// The dialog stays up until the user answers, so it runs without blocking the server.
+// Cancel just closes it. Every browser hears when it opens and closes, so their buttons match.
+async function chooseFolder(socket: ServerWebSocket<unknown>) {
+  if (!folderPicker || folderPickerOpen) return;
+  folderPickerOpen = true;
+  broadcast({ type: "folderPicker", open: true });
+  try {
+    const picker = Bun.spawn(folderPicker, { stdout: "pipe", stderr: "ignore" });
+    const chosenPath = (await new Response(picker.stdout).text()).trim();
+    if ((await picker.exited) === 0 && chosenPath) switchWorkspace(socket, chosenPath);
+  } finally {
+    folderPickerOpen = false;
+    broadcast({ type: "folderPicker", open: false });
+  }
 }
 
 // Stops every member of a workspace without pinging its Manager about it.
@@ -2761,6 +2794,7 @@ function handleClientMessage(socket: ServerWebSocket<unknown>, raw: string | Buf
     return;
   }
   if (message.type === "workspace") return switchWorkspace(socket, String(message.path ?? ""));
+  if (message.type === "chooseFolder") return void chooseFolder(socket);
   if (message.type === "closeWorkspace") return closeWorkspace(String(message.path ?? ""));
   if (message.type === "addWorker" || message.type === "removeWorker") return changeMembers(socket, message);
   if (message.type === "reorderMembers") return reorderWorkersFrom(socket, message.order);
