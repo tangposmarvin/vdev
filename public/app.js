@@ -101,6 +101,7 @@ const elements = {
   settingsStatus: document.querySelector(".js-settings-status"),
   closeSettingsButton: document.querySelector(".js-close-settings"),
   addWorkerButton: document.querySelector(".js-add-worker"),
+  teamHint: document.querySelector(".js-team-hint"),
   allowAllPermissionsButton: document.querySelector(".js-allow-all-permissions"),
 };
 
@@ -288,6 +289,9 @@ function renderWorkspace() {
   elements.workspaceName.textContent = workspace.workspaceName ?? "none selected";
   elements.workspaceToggle.title = workspace.workspace ?? "Pick a folder for the team to work in";
   elements.input.disabled = !workspace.workspace;
+  // Members belong to a workspace, so there is no team to show or add to yet.
+  elements.addWorkerButton.hidden = !workspace.workspace;
+  elements.teamHint.hidden = Boolean(workspace.workspace);
   renderWorkspaceGroup(elements.workspaceRecent, "Recent", workspace.recentWorkspaces);
   renderWorkspaceGroup(elements.workspaceCandidates, "Repositories", workspace.candidateWorkspaces);
 }
@@ -378,7 +382,11 @@ function toggleWorkspacePanel(open = elements.workspacePanel.hidden) {
 }
 
 function openWorkspace(path) {
-  if (!path) return;
+  if (!path) {
+    elements.workspaceError.textContent = "Type the path of a project folder, e.g. ~/Documents/my-app";
+    elements.workspaceError.hidden = false;
+    return;
+  }
   elements.workspaceError.hidden = true;
   send({ type: "workspace", path });
 }

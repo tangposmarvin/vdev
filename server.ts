@@ -181,17 +181,18 @@ const silentAlertMilliseconds = (watchdogConfig.silentMinutes ?? 5) * 60_000;
 const checkInMilliseconds = (watchdogConfig.checkInMinutes ?? 15) * 60_000;
 const reviewApprovals = watchdogConfig.reviewApprovals ?? true;
 
-function expandPath(path: string): string {
-  return resolve(rootDirectory, path.trim().replace(/^~(?=\/|$)/, homedir()));
+function expandPath(path: string, baseDirectory = rootDirectory): string {
+  return resolve(baseDirectory, path.trim().replace(/^~(?=\/|$)/, homedir()));
 }
 
 // Returns the canonical path, or throws with a message suitable for the UI.
+// A relative path is taken from the home folder, e.g. "Documents/my-app".
 // vdev's own directory (and anything inside or above it) is refused so members
 // can never edit team.json or server.ts and widen their own permissions.
 function validateWorkspace(path: string): string {
   let canonicalPath: string;
   try {
-    canonicalPath = realpathSync(expandPath(path));
+    canonicalPath = realpathSync(expandPath(path, homedir()));
   } catch {
     throw new Error(`Folder not found: ${path}`);
   }
@@ -389,9 +390,10 @@ function recentWorkspaces(): string[] {
 }
 
 // Git repositories one level below each workspace root, e.g. ~/code/*.
+// Roots that do not exist on this machine are skipped.
 function candidateWorkspaces(): string[] {
   const candidates: string[] = [];
-  for (const workspaceRoot of teamConfig.workspaceRoots ?? ["~/code"]) {
+  for (const workspaceRoot of teamConfig.workspaceRoots ?? ["~/code", "~/Projects", "~/Developer", "~/Documents"]) {
     let entries: string[];
     try {
       entries = readdirSync(expandPath(workspaceRoot));

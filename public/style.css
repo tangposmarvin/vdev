@@ -527,6 +527,7 @@ button { font: inherit; color: inherit; }
 
 .workspace-panel .button { border-color: var(--sidebar-border); background: var(--sidebar-input-bg); color: var(--sidebar-text-strong); }
 .workspace-error { margin: 4px 8px; font-size: 13px; color: var(--sidebar-text-strong); }
+.team-hint { margin: 4px 8px; font-size: 13px; color: var(--sidebar-text); }
 
 /* Footer ---------------------------------------------------------------- */
 
