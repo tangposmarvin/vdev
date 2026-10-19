@@ -9,3 +9,6 @@ vdev.sqlite-*
 
 # Local team config (copied from team.example.json by bin/install)
 team.json
+
+# Local planning notes
+plan.md
