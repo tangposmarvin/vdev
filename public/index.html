@@ -20,6 +20,12 @@
           <span class="workspace-chevron" aria-hidden="true"></span>
         </button>
         <span class="connection js-connection" data-state="connecting">connecting</span>
+        <button type="button" class="icon-button js-open-settings" title="Settings" aria-label="Settings">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
+          </svg>
+        </button>
       </header>
 
       <div class="workspace-panel js-workspace-panel" hidden>
@@ -39,24 +45,15 @@
             <button type="button" class="allow-all-permissions js-allow-all-permissions" hidden title="Run every pending tool call in this workspace once; no rules are saved"></button>
           </div>
           <ul class="member-list js-member-list"></ul>
-          <button type="button" class="sidebar-item add-member js-add-member">
+          <button type="button" class="sidebar-item add-member js-add-worker">
             <span class="sidebar-item-icon" aria-hidden="true">+</span>
-            <span>Add member</span>
+            <span>Add worker</span>
           </button>
         </section>
         <section class="sidebar-section active-workspaces js-active-workspaces" hidden></section>
       </nav>
 
       <footer class="sidebar-footer">
-        <button type="button" class="sidebar-item js-open-settings" disabled>
-          <span class="sidebar-item-icon" aria-hidden="true">#</span>
-          <span>Project settings</span>
-        </button>
-        <div class="theme-switch" role="radiogroup" aria-label="Theme">
-          <button type="button" class="theme-option js-theme-option" role="radio" data-theme-choice="light" aria-checked="false">Light</button>
-          <button type="button" class="theme-option js-theme-option" role="radio" data-theme-choice="dark" aria-checked="false">Dark</button>
-          <button type="button" class="theme-option js-theme-option" role="radio" data-theme-choice="system" aria-checked="true">System</button>
-        </div>
         <div class="limit js-rate-limit">Plan limit: unknown</div>
       </footer>
     </aside>
@@ -71,11 +68,11 @@
           </div>
         </div>
         <div class="chat-actions">
-          <button type="button" class="button js-permissions" disabled title="This member's permissions in Project settings">Permissions</button>
-          <button type="button" class="button js-edit-member" disabled title="Change this member's model, prompt and tools">Edit</button>
+          <button type="button" class="button js-toggle-activity" aria-pressed="false" hidden title="Also show handoffs, worker messages, watchdog notices and tool calls">Show activity</button>
           <button type="button" class="button js-compact" title="Summarize this member's context to free tokens">Compact</button>
           <button type="button" class="button js-reset" title="Drop this member's context and start a fresh session">New session</button>
           <button type="button" class="button button-danger js-stop" title="Stop current and queued work">Stop</button>
+          <button type="button" class="button button-danger js-remove-worker" hidden title="Remove this worker from the team">Remove</button>
         </div>
       </header>
 
@@ -83,47 +80,42 @@
 
       <section class="permission-requests js-permission-requests" aria-live="assertive" hidden></section>
 
+      <section class="task-summary js-task-summary" aria-label="Task summary" hidden>
+        <header class="task-summary-header">
+          <h3 class="task-summary-title">Task summary</h3>
+          <span class="task-summary-counts js-task-summary-counts"></span>
+          <button type="button" class="button button-small js-archive-done" hidden title="Remove done items from the list">Clear done</button>
+          <button type="button" class="button button-small js-archive-all" title="Remove all items from the list">Clear all</button>
+        </header>
+        <ol class="task-summary-list js-task-summary-list"></ol>
+        <div class="schedule-section js-schedule-section" hidden>
+          <h4 class="schedule-title">Scheduled</h4>
+          <ul class="task-summary-list js-schedule-list"></ul>
+        </div>
+      </section>
+
       <section class="messages js-messages" aria-live="polite"></section>
 
-      <form class="composer js-composer">
-        <p class="composer-error js-composer-error" hidden></p>
-        <div class="composer-box">
-          <ul class="attachment-list js-attachment-list" hidden></ul>
-          <textarea class="composer-input js-input" rows="1" placeholder="Message manager"></textarea>
-          <div class="composer-toolbar">
-            <button type="button" class="composer-attach js-attach" title="Attach files (you can also paste or drop them)" aria-label="Attach files">+</button>
-            <input type="file" class="js-file-input" multiple hidden>
-            <span class="composer-hint">Enter to send, Shift+Enter for a new line, @name to message a member</span>
-            <button type="submit" class="composer-send">Send</button>
-          </div>
-        </div>
-      </form>
+      <form class="composer js-composer" data-hint="Enter to send, Shift+Enter for a new line, @name to message a member"></form>
     </main>
 
     <aside class="thread-panel js-thread-panel" aria-label="Thread" hidden>
+      <div class="thread-resize-handle js-thread-resize" role="separator" aria-orientation="vertical" aria-label="Resize thread" tabindex="0" title="Drag to resize, double-click to reset"></div>
       <header class="chat-header thread-header">
         <div class="chat-title-text">
-          <h2 class="thread-title">Thread</h2>
+          <h2 class="thread-title js-thread-title">Thread</h2>
           <span class="chat-meta js-thread-meta"></span>
         </div>
         <button type="button" class="button js-close-thread" aria-label="Close thread">Close</button>
       </header>
       <section class="messages js-thread-messages" aria-live="polite"></section>
-      <form class="composer js-thread-composer">
-        <div class="composer-box">
-          <textarea class="composer-input js-thread-input" rows="1" placeholder="Reply..."></textarea>
-          <div class="composer-toolbar">
-            <span class="composer-hint">Enter to send. The answer stays in this thread.</span>
-            <button type="submit" class="composer-send">Send</button>
-          </div>
-        </div>
-      </form>
+      <form class="composer js-thread-composer" data-hint="Enter to send. The answer stays in this thread."></form>
     </aside>
 
     <main class="settings-page js-settings-page" hidden>
       <header class="chat-header">
         <div class="chat-title">
-          <h2 class="settings-title">Project settings</h2>
+          <h2 class="settings-title">Settings</h2>
           <span class="chat-meta js-settings-path"></span>
         </div>
         <div class="chat-actions">
@@ -132,40 +124,116 @@
       </header>
 
       <form class="settings-form js-settings-form">
-        <section class="settings-section">
-          <h3 class="settings-section-title">Project rules</h3>
-          <p class="form-hint">Instructions every member follows in this project, added to their prompt. Use it for conventions and how to run things.</p>
-          <textarea class="form-input form-textarea" name="instructions" rows="7" maxlength="20000" placeholder="Run specs with bin/rspec, never with rails test.&#10;Use the staging database for manual checks.&#10;Commit nothing; leave changes unstaged for review."></textarea>
-        </section>
-
-        <section class="settings-section">
-          <h3 class="settings-section-title">Permissions for all members</h3>
-          <p class="form-hint">Allow rules every member gets in this project, on top of their own. One per line; a trailing * matches any arguments.</p>
-          <textarea class="form-input form-textarea form-mono" name="allowedTools" rows="5" spellcheck="false" placeholder="Bash(bin/rspec *)&#10;Bash(bundle exec rspec *)&#10;Bash(npm run *)"></textarea>
+        <fieldset class="settings-section js-agent-fields" data-agent="worker">
+          <legend class="settings-section-title">Workers</legend>
+          <p class="form-hint">One setting for every worker, in every project. Workers run like <code>claude</code> in your terminal in the project folder: your settings, CLAUDE.md, skills, commands and MCP servers. Empty fields use your Claude Code defaults.</p>
+          <div class="form-grid">
+            <label class="form-field">
+              <span class="form-label">Model</span>
+              <select class="form-input js-model-select" name="model"></select>
+              <input class="form-input form-mono" name="customModel" maxlength="80" spellcheck="false" placeholder="claude-..." aria-label="Worker model ID" hidden>
+            </label>
+            <label class="form-field">
+              <span class="form-label">Effort</span>
+              <select class="form-input js-effort-select" name="effort"></select>
+            </label>
+            <label class="form-field">
+              <span class="form-label">Permission mode</span>
+              <select class="form-input" name="permissionMode">
+                <option value="">acceptEdits (default)</option>
+                <option value="default">default</option>
+                <option value="acceptEdits">acceptEdits</option>
+                <option value="plan">plan</option>
+                <option value="dontAsk">dontAsk</option>
+                <option value="bypassPermissions">bypassPermissions (unsafe)</option>
+              </select>
+            </label>
+            <label class="form-field">
+              <span class="form-label">Task budget (tokens)</span>
+              <input class="form-input" name="budget" type="number" min="1000" step="1000" placeholder="150000">
+            </label>
+          </div>
+          <label class="form-field">
+            <span class="form-label">Allowed tools</span>
+            <textarea class="form-input form-textarea form-mono" name="allowedTools" rows="5" spellcheck="false" placeholder="Read&#10;Edit&#10;Bash(git diff *)"></textarea>
+            <span class="form-hint">Run without asking, in every project, on top of your own Claude Code allow rules. One per line; a trailing * matches any arguments.</span>
+          </label>
+          <label class="form-field">
+            <span class="form-label">Extra instructions</span>
+            <textarea class="form-input form-textarea" name="prompt" rows="3" maxlength="20000" placeholder="(none: same as claude in your terminal)"></textarea>
+          </label>
           <label class="form-checkbox">
-            <input type="checkbox" name="sharePermissions">
+            <input type="checkbox" name="chrome">
             <span>
-              <span class="form-label">Share approved permissions with all members</span>
-              <span class="form-hint">"Always allow" saves the rule here for every member, not just the one who asked, and approves other members' identical requests that are already waiting. Turn off to save rules per member.</span>
+              <span class="form-label">Claude in Chrome</span>
+              <span class="form-hint">Workers drive your real Chrome (with your logins). Each site is approved once; "Always allow" saves ClaudeInChromeDomain(site) to this project's permissions. Off follows your own Claude Code setting.</span>
             </span>
           </label>
-        </section>
+        </fieldset>
 
-        <section class="settings-section">
-          <h3 class="settings-section-title">Claude in Chrome</h3>
-          <label class="form-checkbox">
-            <input type="checkbox" name="chrome" class="js-settings-chrome">
-            <span>
-              <span class="form-label">Enable for all members in this project</span>
-              <span class="form-hint">Members drive your real Chrome (with your logins). Each site is approved once, like in a terminal: "Always allow" saves ClaudeInChromeDomain(site) to the permissions above for every member; ClaudeInChromeDomain(*) allows every site. When this is off, use each member's Chrome switch below.</span>
-            </span>
+        <fieldset class="settings-section js-agent-fields" data-agent="manager">
+          <legend class="settings-section-title">Manager</legend>
+          <div class="form-grid">
+            <label class="form-field">
+              <span class="form-label">Model</span>
+              <select class="form-input js-model-select" name="model"></select>
+              <input class="form-input form-mono" name="customModel" maxlength="80" spellcheck="false" placeholder="claude-..." aria-label="Manager model ID" hidden>
+            </label>
+            <label class="form-field">
+              <span class="form-label">Effort</span>
+              <select class="form-input js-effort-select" name="effort"></select>
+            </label>
+          </div>
+          <label class="form-field">
+            <span class="form-label">Instructions</span>
+            <textarea class="form-input form-textarea" name="prompt" rows="4" maxlength="20000"></textarea>
           </label>
-        </section>
+        </fieldset>
+
+        <fieldset class="settings-section js-project-fields">
+          <legend class="settings-section-title">Project <span class="settings-project-name js-settings-project-name"></span></legend>
+          <label class="form-field">
+            <span class="form-label">Rules</span>
+            <textarea class="form-input form-textarea" name="instructions" rows="6" maxlength="20000" placeholder="Run specs with bin/rspec, never with rails test.&#10;Use the staging database for manual checks."></textarea>
+            <span class="form-hint">Followed by every member in this project, added to their prompt.</span>
+          </label>
+          <label class="form-field">
+            <span class="form-label">Permissions</span>
+            <textarea class="form-input form-textarea form-mono" name="allowedTools" rows="5" spellcheck="false" placeholder="Bash(bin/rspec *)&#10;Bash(npm run *)"></textarea>
+            <span class="form-hint">Allowed for every member in this project only. "Always allow" on a request adds its rule here.</span>
+          </label>
+        </fieldset>
+
+        <fieldset class="settings-section js-api-fields">
+          <legend class="settings-section-title">Usage</legend>
+          <label class="form-field">
+            <span class="form-label">Anthropic API key</span>
+            <input class="form-input form-mono" name="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-...">
+            <span class="form-hint js-api-key-hint">Stored only in vdev's local database. Create one at console.anthropic.com; API usage is billed to that account.</span>
+          </label>
+          <label class="form-checkbox js-clear-api-key-field" hidden>
+            <input type="checkbox" name="clearApiKey">
+            <span class="form-label">Remove the saved key</span>
+          </label>
+          <div class="form-field">
+            <span class="form-label" id="api-mode-label">Use the API key</span>
+            <div class="theme-switch" role="radiogroup" aria-labelledby="api-mode-label">
+              <label class="theme-option api-mode-option"><input type="radio" name="apiMode" value="off">Never</label>
+              <label class="theme-option api-mode-option"><input type="radio" name="apiMode" value="fallback">On plan limit</label>
+              <label class="theme-option api-mode-option"><input type="radio" name="apiMode" value="always">Always</label>
+            </div>
+            <span class="form-hint js-api-mode-hint"></span>
+          </div>
+          <p class="form-hint usage-active js-api-fallback-status" hidden></p>
+        </fieldset>
 
         <section class="settings-section">
-          <h3 class="settings-section-title">Per member</h3>
-          <p class="form-hint">Claude in Chrome and extra permission rules for one member in this project. The grey list is what the member always has (Edit member).</p>
-          <div class="settings-members js-settings-members"></div>
+          <h3 class="settings-section-title">Appearance</h3>
+          <div class="theme-switch" role="radiogroup" aria-label="Theme">
+            <button type="button" class="theme-option js-theme-option" role="radio" data-theme-choice="light" aria-checked="false">Light</button>
+            <button type="button" class="theme-option js-theme-option" role="radio" data-theme-choice="dark" aria-checked="false">Dark</button>
+            <button type="button" class="theme-option js-theme-option" role="radio" data-theme-choice="system" aria-checked="true">System</button>
+          </div>
         </section>
 
         <footer class="settings-actions">
@@ -176,108 +244,20 @@
       </form>
     </main>
   </div>
-  <dialog class="member-dialog js-member-dialog" aria-labelledby="member-form-title">
-    <form class="member-form js-member-form">
-      <h2 class="member-form-title js-member-form-title" id="member-form-title">Add member</h2>
-      <label class="form-field js-template-field">
-        <span class="form-label">Copy from</span>
-        <select class="form-input js-template-select" name="template">
-          <option value="">Start empty</option>
-        </select>
-        <span class="form-hint">Starts from an existing member's role, model, prompt, tools and per-project permissions, e.g. to run several QA members in parallel.</span>
-      </label>
-      <div class="form-grid">
-        <label class="form-field">
-          <span class="form-label">Name</span>
-          <input class="form-input" name="name" required maxlength="32" pattern="[a-z][a-z0-9_\-]*" spellcheck="false" placeholder="frontend">
-          <span class="form-hint">Used for @mentions and delegation. Cannot be changed later.</span>
-        </label>
-        <label class="form-field">
-          <span class="form-label">Role</span>
-          <input class="form-input" name="role" required maxlength="120" placeholder="Frontend developer (React, CSS)">
-        </label>
-        <label class="form-field">
-          <span class="form-label">Model</span>
-          <select class="form-input js-model-select" name="model">
-            <optgroup label="Latest (updates automatically)">
-              <option value="fable">Fable (latest)</option>
-              <option value="opus">Opus (latest)</option>
-              <option value="sonnet">Sonnet (latest)</option>
-              <option value="haiku">Haiku (latest)</option>
-            </optgroup>
-            <optgroup label="Pinned version">
-              <option value="claude-fable-5-1">Fable 5.1</option>
-              <option value="claude-opus-5-5">Opus 5.5</option>
-              <option value="claude-sonnet-5-5">Sonnet 5.5</option>
-              <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
-            </optgroup>
-            <option value="custom">Other model ID...</option>
-          </select>
-          <input class="form-input form-mono js-custom-model" name="customModel" maxlength="80" spellcheck="false" placeholder="claude-..." aria-label="Model ID" hidden>
-        </label>
-        <label class="form-field">
-          <span class="form-label">Effort</span>
-          <select class="form-input" name="effort">
-            <option value="">default</option>
-            <option value="low">low</option>
-            <option value="medium">medium</option>
-            <option value="high">high</option>
-            <option value="xhigh">xhigh</option>
-            <option value="max">max</option>
-          </select>
-        </label>
-        <label class="form-field">
-          <span class="form-label">Permission mode</span>
-          <select class="form-input" name="permissionMode">
-            <option value="">default (acceptEdits)</option>
-            <option value="default">default</option>
-            <option value="acceptEdits">acceptEdits</option>
-            <option value="plan">plan</option>
-            <option value="dontAsk">dontAsk</option>
-            <option value="bypassPermissions">bypassPermissions (unsafe)</option>
-          </select>
-        </label>
-        <label class="form-field">
-          <span class="form-label">Task budget (tokens)</span>
-          <input class="form-input" name="budget" type="number" min="1000" step="1000" placeholder="150000">
-        </label>
+  <!-- Shared markup for every message box; app.js fills each .composer form from it. -->
+  <template class="js-composer-template">
+    <p class="composer-error js-composer-error" hidden></p>
+    <div class="composer-box">
+      <ul class="attachment-list js-attachment-list" hidden></ul>
+      <textarea class="composer-input js-composer-input" rows="1"></textarea>
+      <div class="composer-toolbar">
+        <button type="button" class="composer-attach js-attach" title="Attach files (you can also paste or drop them)" aria-label="Attach files">+</button>
+        <input type="file" class="js-file-input" multiple hidden>
+        <span class="composer-hint js-composer-hint"></span>
+        <button type="submit" class="composer-send">Send</button>
       </div>
-      <label class="form-field">
-        <span class="form-label">Prompt</span>
-        <textarea class="form-input form-textarea" name="prompt" rows="5" required maxlength="20000"></textarea>
-      </label>
-      <div class="form-grid">
-        <label class="form-field">
-          <span class="form-label">Allowed tools</span>
-          <textarea class="form-input form-textarea form-mono" name="allowedTools" rows="5" spellcheck="false" placeholder="Read&#10;Edit&#10;Bash(git diff *)"></textarea>
-          <span class="form-hint">One rule per line. Anything not allowed is denied.</span>
-        </label>
-        <label class="form-field">
-          <span class="form-label">Available tools</span>
-          <textarea class="form-input form-textarea form-mono" name="tools" rows="5" spellcheck="false" placeholder="(all)"></textarea>
-          <span class="form-hint">One per line. Empty means every built-in tool.</span>
-        </label>
-      </div>
-      <label class="form-field">
-        <span class="form-label">Autocompact</span>
-        <input class="form-input" name="autocompact" maxlength="40" spellcheck="false" placeholder="(Claude Code default)">
-      </label>
-      <label class="form-checkbox">
-        <input type="checkbox" name="chrome">
-        <span>
-          <span class="form-label">Claude in Chrome (default)</span>
-          <span class="form-hint">Lets this member drive your Chrome (with your logins) through the extension. Its tools are auto-allowed; the extension's site permissions still apply. This is the default for every project; Project settings can turn it on or off per project.</span>
-        </span>
-      </label>
-      <p class="form-error js-member-form-error" hidden></p>
-      <footer class="member-form-actions">
-        <button type="button" class="button button-danger js-remove-member">Remove member</button>
-        <span class="member-form-spacer"></span>
-        <button type="button" class="button js-cancel-member">Cancel</button>
-        <button type="submit" class="button button-primary js-save-member">Save</button>
-      </footer>
-    </form>
-  </dialog>
+    </div>
+  </template>
   <script src="/app.js"></script>
 </body>
 </html>

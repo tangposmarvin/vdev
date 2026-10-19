@@ -6,37 +6,85 @@ import { Database } from "bun:sqlite";
 import type { ServerWebSocket, Subprocess } from "bun";
 import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
+} from "node:fs";
 
-type MemberConfig = {
-  name: string;
-  role: string;
-  model: string;
-  prompt: string;
+// Settings shared by every worker (or the manager). Anything left out falls back to
+// what a plain `claude` in the workspace would use, e.g. your default model.
+type AgentConfig = {
+  model?: string;
+  // Added to Claude Code's own system prompt; the worker default is none.
+  prompt?: string;
   effort?: string;
   tools?: string[];
   allowedTools?: string[];
   permissionMode?: string;
-  autocompact?: string;
   budget?: number;
   chrome?: boolean;
-  // true: only the team MCP server, without your own MCP servers and claude.ai connectors.
-  strictMcp?: boolean;
 };
+
+type MemberConfig = AgentConfig & { name: string };
 
 type TeamConfig = {
   port?: number;
   projectDir?: string;
   workspaceRoots?: string[];
-  // Your own slash commands (~/.claude/commands/<name>.md) that members may use, e.g. ["cm", "br"].
-  commands?: string[];
   idleMinutes?: number;
-  members: MemberConfig[];
+  watchdog?: WatchdogConfig;
+  manager: AgentConfig;
+  worker: AgentConfig;
+  // Worker names, in sidebar order. Every worker runs with the same `worker` settings.
+  workers: string[];
 };
+
+// When the server wakes the Manager about a worker's task. 0 turns a check off.
+type WatchdogConfig = {
+  // A tool call has waited this long for the user's approval.
+  approvalMinutes?: number;
+  // No output from the worker for this long (repeats at 2x, 4x, ...).
+  silentMinutes?: number;
+  // A progress check every this many minutes of work on one task.
+  checkInMinutes?: number;
+  // Show the Manager each approval a worker asks for, so it can send the worker a route
+  // that needs none. On unless false.
+  reviewApprovals?: boolean;
+};
+
+// Per turn, so each notice is sent once.
+type WatchState = { approvalAlerts: Set<string>; silentAlerts: number; checkIns: number };
 
 // threadId: the root event of the thread a user reply was sent in; the member's
 // output for that turn is filed under the same thread.
-type TurnOrigin = { kind: "user" | "task" | "handoff" | "command"; taskId?: number; threadId?: number };
+// itemId: the task summary line the turn is about (Manager only); its output is filed under that item.
+type TurnOrigin = { kind: "user" | "task" | "handoff" | "command"; taskId?: number; threadId?: number; itemId?: number };
+
+// Where an event is filed, and which kind of turn produced it.
+type EventPlacement = { threadId?: number | null; itemId?: number | null; origin?: TurnOrigin["kind"] | null };
+
+type EventRow = {
+  id: number; kind: string; text: string; created_at: number;
+  thread_id: number | null; item_id: number | null; origin: string | null;
+};
+const EVENT_COLUMNS = "id, kind, text, created_at, thread_id, item_id, origin";
+
+type TaskRow = {
+  id: number; workspace: string | null; member: string; brief: string; status: string;
+  budget: number; spent: number; item_id: number | null;
+};
+
+// Work the Manager set for later; at run_at the server wakes the Manager with its instructions.
+type ScheduleRow = {
+  id: number; workspace: string; title: string; instructions: string; run_at: number; status: string; created_at: number;
+};
+
+type ItemStatus = "working" | "needs_input" | "done" | "failed" | "stopped";
+const ITEM_STATUSES_FOR_MANAGER: ItemStatus[] = ["working", "needs_input", "done", "failed"];
+
+type ItemRow = {
+  id: number; workspace: string; title: string; member: string; status: ItemStatus;
+  summary: string; questions: string; report: string; archived: number; created_at: number; updated_at: number;
+};
 
 // A tool call waiting for the user's Allow / Deny in the UI.
 type PermissionRequest = {
@@ -61,6 +109,10 @@ type MemberRuntime = {
   sessionId: string | null;
   process: Subprocess<"pipe", "pipe", "pipe"> | null;
   origins: TurnOrigin[];
+  // Stdin lines for the turns queued behind origins[0], written one at a time as each turn ends.
+  // Writing them at once lets the CLI fold several into one turn with one result, which would
+  // shift origins and file replies in the wrong thread or task summary item.
+  queuedInputs: string[];
   status: "asleep" | "starting" | "idle" | "working" | "compacting";
   contextTokens: number;
   contextWindow: number;
@@ -68,17 +120,26 @@ type MemberRuntime = {
   warnedTaskId: number | null;
   totalSpent: number;
   lastActiveAt: number;
+  // Last line the member's process wrote; unlike lastActiveAt, messages sent to it do not count.
+  lastOutputAt: number;
+  // When the turn at the front of origins started.
+  turnStartedAt: number;
+  watch: WatchState;
+  // The Manager interrupted the current turn; its result does not end the task.
+  interrupting: boolean;
   pendingDelta: string;
   deltaTimer: Timer | null;
   stderrTail: string;
   restartPending: boolean;
-  // Extra allow rules for this workspace only, on top of team.json's allowedTools.
-  workspaceAllowedTools: string[];
-  // Claude in Chrome override for this workspace; null = the member's team.json default.
-  projectChrome: boolean | null;
   permissionRequests: PermissionRequest[];
   // Tool calls you denied in the UI; their denial needs no "add a rule" hint.
   deniedByUser: Set<string>;
+  // Chrome tabs opened minus tabs closed since the context was last cleared.
+  openTabs: number;
+  // How the running process is billed: your Claude plan, or the Anthropic API key from Settings.
+  billing: "plan" | "api";
+  // A rate_limit_event rejected the current turn: the plan limit is reached.
+  planLimitHit: boolean;
 };
 
 // One set of member processes per workspace, so switching workspaces in the UI
@@ -87,17 +148,16 @@ type Team = {
   workspace: string;
   mcpToken: string;
   // Project settings: instructions and allow rules for every member in this workspace.
+  // "Always allow" saves its rule here, for every member.
   instructions: string;
   allowedTools: string[];
-  chrome: boolean;
-  // "Always allow" saves the rule for every member here instead of only the one who asked.
-  sharePermissions: boolean;
   runtimes: Map<string, MemberRuntime>;
   manager: MemberRuntime;
 };
 
 const DEFAULT_BUDGET = 150_000;
 const DELTA_FLUSH_MS = 150;
+const WATCHDOG_INTERVAL_MS = 30_000;
 // Workers compact themselves when an idle turn ends with context at or above this share of the window.
 const WORKER_AUTO_COMPACT_RATIO = 0.8;
 const HISTORY_LIMIT = 300;
@@ -115,60 +175,11 @@ const teamFilePath = join(rootDirectory, "team.json");
 const teamConfig: TeamConfig = await Bun.file(teamFilePath).json();
 const port = Number(process.env.VDEV_PORT) || teamConfig.port || 4321;
 const idleMilliseconds = (teamConfig.idleMinutes ?? 10) * 60_000;
-
-// ---------------------------------------------------------------- shared slash commands
-
-// Members run without your user settings, so your commands reach them as a small
-// plugin. Plugin commands are namespaced ("/vdev-commands:cm"); sendTurn maps "/cm".
-const COMMAND_PLUGIN_NAME = "vdev-commands";
-const userCommandsDirectory = join(homedir(), ".claude", "commands");
-const commandPluginDirectory = join(rootDirectory, ".member-plugin");
-
-type SharedCommand = { name: string; description: string };
-
-// Copied at startup; restart vdev after editing a command file.
-function buildCommandPlugin(): SharedCommand[] {
-  rmSync(commandPluginDirectory, { recursive: true, force: true });
-  const sharedCommands: SharedCommand[] = [];
-  for (const name of teamConfig.commands ?? []) {
-    if (!/^[a-z0-9][a-z0-9_-]*$/i.test(name)) continue;
-    const sourcePath = join(userCommandsDirectory, `${name}.md`);
-    if (!existsSync(sourcePath)) continue;
-    mkdirSync(join(commandPluginDirectory, "commands"), { recursive: true });
-    copyFileSync(sourcePath, join(commandPluginDirectory, "commands", `${name}.md`));
-    sharedCommands.push({ name, description: commandDescription(readFileSync(sourcePath, "utf8")) });
-  }
-  if (sharedCommands.length === 0) return [];
-  mkdirSync(join(commandPluginDirectory, ".claude-plugin"), { recursive: true });
-  writeFileSync(join(commandPluginDirectory, ".claude-plugin", "plugin.json"), JSON.stringify({
-    name: COMMAND_PLUGIN_NAME, version: "1.0.0", description: "Your slash commands, shared with vdev members",
-  }));
-  return sharedCommands;
-}
-
-// The frontmatter description, else the first heading.
-function commandDescription(markdown: string): string {
-  const frontmatterDescription = markdown.match(/^---\n[\s\S]*?^description:\s*(.+)$[\s\S]*?^---/m)?.[1];
-  const heading = markdown.match(/^#\s+(.+)$/m)?.[1];
-  return (frontmatterDescription ?? heading ?? "").trim().replace(/^["']|["']$/g, "");
-}
-
-const sharedCommands = buildCommandPlugin();
-
-// "/cm fix login" -> "/vdev-commands:cm fix login"; anything else is unchanged.
-function expandSharedCommand(text: string): string {
-  const match = text.match(/^\/([a-z0-9_-]+)(?=\s|$)/i);
-  if (!match || !sharedCommands.some((command) => command.name === match[1])) return text;
-  return `/${COMMAND_PLUGIN_NAME}:${match[1]}${text.slice(match[0].length)}`;
-}
-
-function sharedCommandsNote(): string {
-  if (sharedCommands.length === 0) return "";
-  const list = sharedCommands.map((command) => `- /${command.name}: ${command.description}`).join("\n");
-  return `\n\nThe user's slash commands are available to you:\n${list}\n` +
-    `When asked to run one (e.g. "/${sharedCommands[0].name}"), invoke it with the Skill tool as ` +
-    `"${COMMAND_PLUGIN_NAME}:<name>" and follow its instructions.`;
-}
+const watchdogConfig = teamConfig.watchdog ?? {};
+const approvalAlertMilliseconds = (watchdogConfig.approvalMinutes ?? 2) * 60_000;
+const silentAlertMilliseconds = (watchdogConfig.silentMinutes ?? 5) * 60_000;
+const checkInMilliseconds = (watchdogConfig.checkInMinutes ?? 15) * 60_000;
+const reviewApprovals = watchdogConfig.reviewApprovals ?? true;
 
 function expandPath(path: string): string {
   return resolve(rootDirectory, path.trim().replace(/^~(?=\/|$)/, homedir()));
@@ -191,15 +202,21 @@ function validateWorkspace(path: string): string {
   return canonicalPath;
 }
 
-const managerName = teamConfig.members.find((member) => member.role === "manager")?.name;
-if (!managerName) throw new Error("team.json needs one member with role \"manager\"");
+const MANAGER_NAME = "manager";
+teamConfig.manager ??= {};
+teamConfig.worker ??= {};
+teamConfig.workers ??= [];
 
 function isManagerConfig(memberConfig: MemberConfig): boolean {
-  return memberConfig.name === managerName;
+  return memberConfig.name === MANAGER_NAME;
 }
 
-function workerConfigs(): MemberConfig[] {
-  return teamConfig.members.filter((memberConfig) => !isManagerConfig(memberConfig));
+function memberConfigFor(name: string): MemberConfig {
+  return { ...(name === MANAGER_NAME ? teamConfig.manager : teamConfig.worker), name };
+}
+
+function memberNames(): string[] {
+  return [MANAGER_NAME, ...teamConfig.workers];
 }
 
 // ---------------------------------------------------------------- storage
@@ -212,8 +229,6 @@ database.exec(`
     name TEXT NOT NULL, workspace TEXT NOT NULL, session_id TEXT, PRIMARY KEY (name, workspace));
   CREATE TABLE IF NOT EXISTS project_settings (
     workspace TEXT PRIMARY KEY, instructions TEXT NOT NULL, allowed_tools TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS member_permissions (
-    name TEXT NOT NULL, workspace TEXT NOT NULL, allowed_tools TEXT NOT NULL, PRIMARY KEY (name, workspace));
   CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, member TEXT NOT NULL, kind TEXT NOT NULL,
     text TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -226,26 +241,38 @@ database.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT, member TEXT NOT NULL, input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL, cache_read_tokens INTEGER NOT NULL,
     cache_write_tokens INTEGER NOT NULL, created_at INTEGER NOT NULL);
+  -- A line on the user's task summary. Its id is the id of the task that started it;
+  -- follow-up tasks for the same work point at it through tasks.item_id.
+  CREATE TABLE IF NOT EXISTS items (
+    id INTEGER PRIMARY KEY, workspace TEXT NOT NULL, title TEXT NOT NULL, member TEXT NOT NULL,
+    status TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '', questions TEXT NOT NULL DEFAULT '[]',
+    archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS items_workspace_id ON items (workspace, archived, id);
+  -- status: pending, fired or cancelled.
+  CREATE TABLE IF NOT EXISTS schedules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, workspace TEXT NOT NULL, title TEXT NOT NULL, instructions TEXT NOT NULL,
+    run_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS schedules_status_run_at ON schedules (status, run_at);
 `);
-for (const table of ["events", "tasks"]) {
+
+function ensureColumn(table: string, column: string, definition: string) {
   const columns = database.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
-  if (!columns.some((column) => column.name === "workspace")) database.exec(`ALTER TABLE ${table} ADD COLUMN workspace TEXT`);
+  if (!columns.some((existing) => existing.name === column)) database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
-// Claude in Chrome per project: on for everyone, and a per-member override
-// (NULL = use the member's own default from team.json).
-for (const [table, definition] of [["project_settings", "INTEGER NOT NULL DEFAULT 0"], ["member_permissions", "INTEGER"]]) {
-  const columns = database.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
-  if (!columns.some((column) => column.name === "chrome")) database.exec(`ALTER TABLE ${table} ADD COLUMN chrome ${definition}`);
-}
-// On by default, including for projects saved before the setting existed.
-if (!database.query<{ name: string }, []>("PRAGMA table_info(project_settings)").all().some((column) => column.name === "share_permissions")) {
-  database.exec("ALTER TABLE project_settings ADD COLUMN share_permissions INTEGER NOT NULL DEFAULT 1");
-}
+
+ensureColumn("events", "workspace", "TEXT");
+ensureColumn("tasks", "workspace", "TEXT");
+mergeMemberPermissions();
 database.exec("CREATE INDEX IF NOT EXISTS events_workspace_member_id ON events (workspace, member, id)");
 // Thread replies point at their root event; NULL means the main conversation.
-if (!database.query<{ name: string }, []>("PRAGMA table_info(events)").all().some((column) => column.name === "thread_id")) {
-  database.exec("ALTER TABLE events ADD COLUMN thread_id INTEGER");
-}
+ensureColumn("events", "thread_id", "INTEGER");
+// The task summary line an event belongs to (Manager only), and the kind of turn that produced it.
+ensureColumn("events", "item_id", "INTEGER");
+ensureColumn("events", "origin", "TEXT");
+ensureColumn("tasks", "item_id", "INTEGER");
+// The item's full report as JSON: problem, fix, commit, specs, ui_verification, notes.
+ensureColumn("items", "report", "TEXT NOT NULL DEFAULT '{}'");
+database.exec("CREATE INDEX IF NOT EXISTS events_workspace_item_id ON events (workspace, item_id, id)");
 
 const queries = {
   readSetting: database.query<{ value: string }, [string]>("SELECT value FROM settings WHERE key = ?"),
@@ -255,41 +282,87 @@ const queries = {
   saveSession: database.query(
     "INSERT INTO member_sessions (name, workspace, session_id) VALUES (?1, ?2, ?3) " +
     "ON CONFLICT(name, workspace) DO UPDATE SET session_id = ?3"),
-  insertEvent: database.query<{ id: number }, [string, string, string, string, number, number | null]>(
-    "INSERT INTO events (workspace, member, kind, text, created_at, thread_id) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"),
-  recentEvents: database.query<{ id: number; kind: string; text: string; created_at: number; thread_id: number | null }, [string, string, number]>(
-    "SELECT * FROM (SELECT id, kind, text, created_at, thread_id FROM events WHERE workspace = ? AND member = ? " +
+  insertEvent: database.query<{ id: number }, [string, string, string, string, number, number | null, number | null, string | null]>(
+    "INSERT INTO events (workspace, member, kind, text, created_at, thread_id, item_id, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"),
+  recentEvents: database.query<EventRow, [string, string, number]>(
+    `SELECT * FROM (SELECT ${EVENT_COLUMNS} FROM events WHERE workspace = ? AND member = ? ` +
+    "ORDER BY id DESC LIMIT ?) ORDER BY id"),
+  itemEvents: database.query<EventRow, [string, number, number]>(
+    `SELECT * FROM (SELECT ${EVENT_COLUMNS} FROM events WHERE workspace = ? AND item_id = ? ` +
     "ORDER BY id DESC LIMIT ?) ORDER BY id"),
   threadRoot: database.query<{ id: number; text: string }, [number, string, string]>(
-    "SELECT id, text FROM events WHERE id = ? AND workspace = ? AND member = ? AND kind = 'assistant' AND thread_id IS NULL"),
-  insertTask: database.query<{ id: number }, [string, string, string, number, number]>(
-    "INSERT INTO tasks (workspace, member, brief, status, budget, created_at) VALUES (?, ?, ?, 'running', ?, ?) RETURNING id"),
-  findTask: database.query<{ id: number; member: string; brief: string; status: string; budget: number; spent: number }, [number]>(
-    "SELECT id, member, brief, status, budget, spent FROM tasks WHERE id = ?"),
+    "SELECT id, text FROM events WHERE id = ? AND workspace = ? AND member = ? AND kind = 'assistant' " +
+    "AND thread_id IS NULL AND item_id IS NULL"),
+  insertTask: database.query<{ id: number }, [string, string, string, number, number, number | null]>(
+    "INSERT INTO tasks (workspace, member, brief, status, budget, created_at, item_id) VALUES (?, ?, ?, 'running', ?, ?, ?) RETURNING id"),
+  assignTaskItem: database.query("UPDATE tasks SET item_id = ? WHERE id = ?"),
+  findTask: database.query<TaskRow, [number]>(
+    "SELECT id, workspace, member, brief, status, budget, spent, item_id FROM tasks WHERE id = ?"),
   finishTask: database.query("UPDATE tasks SET status = ?, spent = ?, result = ? WHERE id = ? AND status = 'running'"),
+  runningTaskCount: database.query<{ count: number }, [number]>(
+    "SELECT COUNT(*) AS count FROM tasks WHERE item_id = ? AND status = 'running'"),
+  insertItem: database.query(
+    "INSERT INTO items (id, workspace, title, member, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'working', ?5, ?5)"),
+  findItem: database.query<ItemRow, [number, string]>("SELECT * FROM items WHERE id = ? AND workspace = ?"),
+  visibleItems: database.query<ItemRow, [string, number]>(
+    "SELECT * FROM (SELECT * FROM items WHERE workspace = ? AND archived = 0 ORDER BY id DESC LIMIT ?) ORDER BY id"),
+  saveItem: database.query(
+    "UPDATE items SET member = ?, status = ?, summary = ?, questions = ?, report = ?, archived = ?, updated_at = ? WHERE id = ?"),
+  archiveDoneItems: database.query("UPDATE items SET archived = 1 WHERE workspace = ? AND status = 'done'"),
+  archiveAllItems: database.query("UPDATE items SET archived = 1 WHERE workspace = ?"),
+  archiveItem: database.query("UPDATE items SET archived = 1 WHERE id = ? AND workspace = ?"),
+  insertSchedule: database.query<{ id: number }, [string, string, string, number, number]>(
+    "INSERT INTO schedules (workspace, title, instructions, run_at, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id"),
+  pendingSchedules: database.query<ScheduleRow, [string, number]>(
+    "SELECT * FROM schedules WHERE workspace = ? AND status = 'pending' ORDER BY run_at, id LIMIT ?"),
+  dueSchedules: database.query<ScheduleRow, [number, number]>(
+    "SELECT * FROM schedules WHERE status = 'pending' AND run_at <= ? ORDER BY run_at, id LIMIT ?"),
+  // Returns the row only if it was still pending, so a schedule fires or is cancelled once.
+  settleSchedule: database.query<ScheduleRow, [string, number, string]>(
+    "UPDATE schedules SET status = ? WHERE id = ? AND workspace = ? AND status = 'pending' RETURNING *"),
   insertUsage: database.query(
     "INSERT INTO usage (member, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)"),
   deleteSessions: database.query("DELETE FROM member_sessions WHERE name = ?"),
-  permissionsFor: database.query<{ allowed_tools: string; chrome: number | null }, [string, string]>(
-    "SELECT allowed_tools, chrome FROM member_permissions WHERE name = ? AND workspace = ?"),
-  savePermissions: database.query(
-    "INSERT INTO member_permissions (name, workspace, allowed_tools, chrome) VALUES (?1, ?2, ?3, ?4) " +
-    "ON CONFLICT(name, workspace) DO UPDATE SET allowed_tools = ?3, chrome = ?4"),
-  deletePermissions: database.query("DELETE FROM member_permissions WHERE name = ?"),
-  copyPermissions: database.query(
-    "INSERT OR REPLACE INTO member_permissions (name, workspace, allowed_tools, chrome) " +
-    "SELECT ?1, workspace, allowed_tools, chrome FROM member_permissions WHERE name = ?2"),
-  projectSettingsFor: database.query<{ instructions: string; allowed_tools: string; chrome: number; share_permissions: number }, [string]>(
-    "SELECT instructions, allowed_tools, chrome, share_permissions FROM project_settings WHERE workspace = ?"),
+  projectSettingsFor: database.query<{ instructions: string; allowed_tools: string }, [string]>(
+    "SELECT instructions, allowed_tools FROM project_settings WHERE workspace = ?"),
   saveProjectSettings: database.query(
-    "INSERT INTO project_settings (workspace, instructions, allowed_tools, chrome, share_permissions) VALUES (?1, ?2, ?3, ?4, ?5) " +
-    "ON CONFLICT(workspace) DO UPDATE SET instructions = ?2, allowed_tools = ?3, chrome = ?4, share_permissions = ?5"),
+    "INSERT INTO project_settings (workspace, instructions, allowed_tools) VALUES (?1, ?2, ?3) " +
+    "ON CONFLICT(workspace) DO UPDATE SET instructions = ?2, allowed_tools = ?3"),
   totalSpent: database.query<{ total: number | null }, [string]>(
     "SELECT SUM(input_tokens + output_tokens + cache_write_tokens) AS total FROM usage WHERE member = ?"),
 };
 
+// Per-member rules from older versions become project rules for every member,
+// so nothing approved earlier has to be approved again.
+function mergeMemberPermissions() {
+  const tableExists = database.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'member_permissions'").get();
+  if (!tableExists) return;
+  const memberRows = database.query<{ workspace: string; allowed_tools: string }, []>(
+    "SELECT workspace, allowed_tools FROM member_permissions").all();
+  const rulesByWorkspace = new Map<string, Set<string>>();
+  for (const memberRow of memberRows) {
+    const rules = rulesByWorkspace.get(memberRow.workspace) ?? new Set<string>();
+    for (const rule of parseRules(memberRow.allowed_tools)) rules.add(rule);
+    rulesByWorkspace.set(memberRow.workspace, rules);
+  }
+  database.transaction(() => {
+    for (const [workspace, memberRules] of rulesByWorkspace) {
+      if (memberRules.size === 0) continue;
+      const projectRow = database.query<{ instructions: string; allowed_tools: string }, [string]>(
+        "SELECT instructions, allowed_tools FROM project_settings WHERE workspace = ?").get(workspace);
+      const allowedTools = [...new Set([...parseRules(projectRow?.allowed_tools), ...memberRules])];
+      database.query(
+        "INSERT INTO project_settings (workspace, instructions, allowed_tools) VALUES (?1, ?2, ?3) " +
+        "ON CONFLICT(workspace) DO UPDATE SET allowed_tools = ?3",
+      ).run(workspace, projectRow?.instructions ?? "", JSON.stringify(allowedTools));
+    }
+    database.exec("DROP TABLE member_permissions");
+  })();
+}
+
 // Tasks left running by a previous server process can never finish.
 database.exec("UPDATE tasks SET status = 'stopped' WHERE status = 'running'");
+database.exec("UPDATE items SET status = 'stopped' WHERE status = 'working'");
 
 // ---------------------------------------------------------------- workspace
 
@@ -361,18 +434,15 @@ function teamFor(workspace: string): Team {
     runtimes: new Map(),
     instructions: projectSettings?.instructions ?? "",
     allowedTools: parseRules(projectSettings?.allowed_tools),
-    chrome: Boolean(projectSettings?.chrome),
-    sharePermissions: projectSettings ? Boolean(projectSettings.share_permissions) : true,
   } as Team;
-  for (const memberConfig of teamConfig.members) addRuntime(team, memberConfig);
-  team.manager = team.runtimes.get(managerName!)!;
+  for (const name of memberNames()) addRuntime(team, memberConfigFor(name));
+  team.manager = team.runtimes.get(MANAGER_NAME)!;
   teams.set(workspace, team);
   teamsByMcpToken.set(team.mcpToken, team);
   return team;
 }
 
 function addRuntime(team: Team, memberConfig: MemberConfig) {
-  const memberSettings = queries.permissionsFor.get(memberConfig.name, team.workspace);
   team.runtimes.set(memberConfig.name, {
     config: memberConfig,
     team,
@@ -386,19 +456,25 @@ function addRuntime(team: Team, memberConfig: MemberConfig) {
     warnedTaskId: null,
     totalSpent: queries.totalSpent.get(memberConfig.name)?.total ?? 0,
     lastActiveAt: Date.now(),
+    lastOutputAt: Date.now(),
+    turnStartedAt: Date.now(),
+    watch: newWatchState(),
+    interrupting: false,
+    queuedInputs: [],
     pendingDelta: "",
     deltaTimer: null,
     stderrTail: "",
     restartPending: false,
     permissionRequests: [],
     deniedByUser: new Set(),
-    workspaceAllowedTools: parseRules(memberSettings?.allowed_tools),
-    projectChrome: memberSettings?.chrome === null || memberSettings?.chrome === undefined ? null : Boolean(memberSettings.chrome),
+    openTabs: 0,
+    billing: "plan",
+    planLimitHit: false,
   });
 }
 
 function usesChrome(runtime: MemberRuntime): boolean {
-  return runtime.team.chrome || (runtime.projectChrome ?? Boolean(runtime.config.chrome));
+  return Boolean(runtime.config.chrome);
 }
 
 function parseRules(json: string | undefined): string[] {
@@ -420,6 +496,154 @@ function allRuntimes(): MemberRuntime[] {
 let rateLimit: Record<string, unknown> | null = null;
 let broadcast: (message: unknown) => void = () => {};
 
+// ---------------------------------------------------------------- API usage (plan limit fallback)
+
+// With an Anthropic API key saved, the API mode picks when members use it:
+// "off" never, "always" for every process, or "fallback" like Claude's usage credits: members
+// that hit your plan limit restart on the API key until the limit resets, then go back to the plan.
+// The key lives only in the local database and is never sent to the browser.
+type ApiMode = "off" | "fallback" | "always";
+const API_MODES: ApiMode[] = ["off", "fallback", "always"];
+const API_KEY_SETTING = "anthropic_api_key";
+const API_MODE_SETTING = "api_mode";
+// Before the three-way mode there was only an on/off fallback switch.
+const LEGACY_API_FALLBACK_SETTING = "api_fallback";
+const API_FALLBACK_UNTIL_SETTING = "api_fallback_until";
+// Used when the limit event carries no reset time.
+const API_FALLBACK_DEFAULT_MS = 60 * 60 * 1000;
+const PLAN_LIMIT_PATTERN = /usage limit|hit your limit|limit reached/i;
+const PLAN_LIMIT_CONTINUE_TEXT =
+  "Your previous turn was cut off by a plan usage limit before you could finish. Continue it now from where you left off.";
+
+let apiFallbackTimer: Timer | null = null;
+
+function apiKey(): string {
+  return queries.readSetting.get(API_KEY_SETTING)?.value ?? "";
+}
+
+function apiMode(): ApiMode {
+  const savedMode = queries.readSetting.get(API_MODE_SETTING)?.value;
+  if (API_MODES.includes(savedMode as ApiMode)) return savedMode as ApiMode;
+  return queries.readSetting.get(LEGACY_API_FALLBACK_SETTING)?.value === "true" ? "fallback" : "off";
+}
+
+function apiFallbackUntil(): number {
+  return Number(queries.readSetting.get(API_FALLBACK_UNTIL_SETTING)?.value ?? 0);
+}
+
+function apiFallbackAvailable(): boolean {
+  return apiMode() === "fallback" && apiKey() !== "";
+}
+
+// New processes launch on the API key while this is true.
+function apiFallbackActive(): boolean {
+  return apiFallbackAvailable() && Date.now() < apiFallbackUntil();
+}
+
+function usesApiKey(): boolean {
+  if (apiKey() === "") return false;
+  return apiMode() === "always" || apiFallbackActive();
+}
+
+function apiSettings() {
+  const key = apiKey();
+  return {
+    apiKeyHint: key ? `...${key.slice(-4)}` : null,
+    apiMode: apiMode(),
+    apiFallbackUntil: apiFallbackActive() ? apiFallbackUntil() : null,
+  };
+}
+
+function broadcastApiSettings() {
+  broadcast({ type: "apiSettings", ...apiSettings() });
+}
+
+function activateApiFallback() {
+  const resetsAt = Number(rateLimit?.resetsAt ?? 0) * 1000;
+  const until = resetsAt > Date.now() ? resetsAt : Date.now() + API_FALLBACK_DEFAULT_MS;
+  queries.writeSetting.run(API_FALLBACK_UNTIL_SETTING, String(until));
+  scheduleApiFallbackEnd();
+  broadcastApiSettings();
+}
+
+// When the plan limit resets, members on the API key restart on the plan (busy ones after their work).
+function scheduleApiFallbackEnd() {
+  if (apiFallbackTimer) clearTimeout(apiFallbackTimer);
+  apiFallbackTimer = null;
+  if (!apiFallbackActive()) return;
+  apiFallbackTimer = setTimeout(endApiFallback, apiFallbackUntil() - Date.now());
+}
+
+function endApiFallback() {
+  apiFallbackTimer = null;
+  queries.writeSetting.run(API_FALLBACK_UNTIL_SETTING, "0");
+  restartMembersOnWrongBilling();
+  broadcastApiSettings();
+}
+
+function restartMembersOnWrongBilling() {
+  const billing = usesApiKey() ? "api" : "plan";
+  for (const runtime of allRuntimes()) {
+    if (!runtime.process || runtime.billing === billing) continue;
+    requestRestart(runtime);
+    recordEvent(runtime, "system", billing === "api" ? "Switching to your Anthropic API key." : "Switching back to your Claude plan.");
+    broadcastMember(runtime);
+  }
+}
+
+function processEnvironment(): Record<string, string | undefined> {
+  if (!usesApiKey()) return process.env;
+  return { ...process.env, ANTHROPIC_API_KEY: apiKey() };
+}
+
+// Throws with a message suitable for the UI. An empty key keeps the saved one.
+function saveApiSettings(message: any) {
+  const key = String(message.apiKey ?? "").trim();
+  const mode = String(message.apiMode ?? "off") as ApiMode;
+  if (!API_MODES.includes(mode)) throw new Error("Unknown API usage setting.");
+  if (key && !/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(key)) throw new Error("That does not look like an Anthropic API key (sk-ant-...).");
+  const keyAfterSave = message.clearApiKey ? "" : key || apiKey();
+  if (mode !== "off" && keyAfterSave === "") throw new Error("Add an Anthropic API key to use the API.");
+  if (message.clearApiKey) queries.writeSetting.run(API_KEY_SETTING, "");
+  else if (key) queries.writeSetting.run(API_KEY_SETTING, key);
+  queries.writeSetting.run(API_MODE_SETTING, mode);
+  scheduleApiFallbackEnd();
+  restartMembersOnWrongBilling();
+  broadcastApiSettings();
+}
+
+// The turn hit the plan limit: rerun it on the API key in a fresh process that resumes the session.
+// Returns false when there is no fallback, so the turn ends as a normal error.
+function retryOnApiKey(runtime: MemberRuntime, data: any): boolean {
+  const limitHit = runtime.planLimitHit || (data.is_error && PLAN_LIMIT_PATTERN.test(String(data.result ?? "")));
+  runtime.planLimitHit = false;
+  if (!limitHit || runtime.billing === "api" || runtime.interrupting || runtime.origins.length === 0) return false;
+  if (!apiFallbackAvailable()) return false;
+  if (!apiFallbackActive()) activateApiFallback();
+
+  flushDelta(runtime);
+  recordEvent(runtime, "system", "Plan limit reached; continuing on your Anthropic API key until it resets.");
+  const child = runtime.process;
+  runtime.process = null;
+  runtime.permissionRequests = [];
+  child?.kill();
+  // The turn stays at the front of origins; its result now comes from the new process.
+  const resume = () => {
+    const nextChild = ensureProcess(runtime);
+    nextChild.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: PLAN_LIMIT_CONTINUE_TEXT } }) + "\n");
+    nextChild.stdin.flush();
+    runtime.status = "working";
+    broadcastMember(runtime);
+  };
+  if (child) child.exited.then(resume);
+  else resume();
+  restartMembersOnWrongBilling();
+  return true;
+}
+
+// A fallback still running from before vdev restarted ends on time.
+scheduleApiFallbackEnd();
+
 function currentTask(runtime: MemberRuntime) {
   const origin = runtime.origins[0];
   if (origin?.kind !== "task" || origin.taskId === undefined) return null;
@@ -430,13 +654,10 @@ function publicMember(runtime: MemberRuntime) {
   const task = currentTask(runtime);
   return {
     name: runtime.config.name,
-    role: runtime.config.role,
-    model: runtime.config.model,
+    role: isManager(runtime) ? "manager" : "worker",
+    model: runtime.config.model ?? "default model",
     chrome: usesChrome(runtime),
-    chromeDefault: Boolean(runtime.config.chrome),
-    projectChrome: runtime.projectChrome,
-    allowedTools: runtime.config.allowedTools ?? [],
-    workspaceAllowedTools: runtime.workspaceAllowedTools,
+    billing: runtime.process ? runtime.billing : null,
     isManager: isManager(runtime),
     status: runtime.status,
     queued: Math.max(runtime.origins.filter((origin) => origin.kind !== "command").length - 1, 0),
@@ -469,18 +690,25 @@ function broadcastMember(runtime: MemberRuntime) {
   broadcast({ type: "workspaces", activeWorkspaces: activeWorkspaces() });
 }
 
-function recordEvent(runtime: MemberRuntime, kind: string, text: string, threadId: number | null = null) {
+function recordEvent(runtime: MemberRuntime, kind: string, text: string, placement: EventPlacement = {}) {
   const createdAt = Date.now();
-  const row = queries.insertEvent.get(runtime.team.workspace, runtime.config.name, kind, text, createdAt, threadId)!;
+  const threadId = placement.threadId ?? null;
+  const itemId = placement.itemId ?? null;
+  const origin = placement.origin ?? null;
+  const row = queries.insertEvent.get(runtime.team.workspace, runtime.config.name, kind, text, createdAt, threadId, itemId, origin)!;
   broadcast({
     type: "event", workspace: runtime.team.workspace, member: runtime.config.name,
-    event: { id: row.id, kind, text, created_at: createdAt, thread_id: threadId },
+    event: { id: row.id, kind, text, created_at: createdAt, thread_id: threadId, item_id: itemId, origin },
   });
 }
 
-// The thread the member's current turn belongs to, if it answers a thread reply.
-function currentThreadId(runtime: MemberRuntime): number | null {
-  return runtime.origins[0]?.threadId ?? null;
+function placementFor(origin: TurnOrigin | undefined): EventPlacement {
+  return { threadId: origin?.threadId ?? null, itemId: origin?.itemId ?? null, origin: origin?.kind ?? null };
+}
+
+// Where the member's current turn files its output: a thread it answers, a task summary item, or the main chat.
+function currentPlacement(runtime: MemberRuntime): EventPlacement {
+  return placementFor(runtime.origins[0]);
 }
 
 // ---------------------------------------------------------------- processes
@@ -532,28 +760,71 @@ const THREAD_NOTE = "\n\nThe user may answer one of your earlier messages in a t
   "questions, and do not start the work, until they are all answered or the user says to go ahead.";
 const THREAD_QUOTE_CHARACTERS = 800;
 
+const TASK_SUMMARY_NOTE = "The user follows the team's work on a task summary: one numbered item per delegated task, in the order " +
+  "requested, each with its status, a one-line summary and its open questions. Give every delegate_task a short title (the " +
+  "ticket key or a few words). More work on an existing item (a fix, a follow-up after the user answers) goes through " +
+  "delegate_task with follows_up set to one of its task numbers, so it stays on the same line.\n" +
+  "The user does not see handoffs, worker messages, watchdog notices, or anything you write while handling them. " +
+  "Report to the user only with update_item: a one-line summary when an item is done or failed, or status needs_input with " +
+  "one short question per decision the user must make. This replaces reporting back or asking questions in chat. " +
+  "When an item is done or failed, also fill its report from the handoff: problem, fix, commit, specs and ui_verification. " +
+  "Say plainly when something was not done (specs 'not run', commit 'not committed') rather than leaving it out; " +
+  "if the handoff lacks a fact, ask the worker with message_member before reporting. " +
+  "Your plain replies are shown only when you answer the user's own messages in the main chat; keep those to a line or two " +
+  "and never repeat item summaries there.\n" +
+  "The user answers an item in its thread; those messages start with [Thread reply about item #N ...] quoting its open " +
+  "questions as q1, q2, .... Act on the answer (message_member, or delegate_task with follows_up), and once the item's " +
+  "questions are settled, call update_item with the remaining questions (or questions: []) and the new status.";
+
+// Workers get only what the team needs on top of Claude Code's own prompt, so they
+// know exactly what a plain `claude` in the workspace knows.
 function rolePromptFor(memberConfig: MemberConfig, chrome: boolean): string {
+  const ownPrompt = memberConfig.prompt?.trim() ? `${memberConfig.prompt.trim()}\n\n` : "";
   if (isManagerConfig(memberConfig)) {
-    const roster = workerConfigs().map((worker) => `- ${worker.name}: ${worker.role}`).join("\n");
-    return `${memberConfig.prompt}\n\nYour team (use these names with delegate_task):\n${roster}\n` +
-      "The user can add members while you run; team_status always shows the current team, so check it before saying a member does not exist.\n\n" +
+    return `${ownPrompt}Your workers (use these names with delegate_task): ${teamConfig.workers.join(", ") || "(none yet)"}.\n` +
+      "Every worker is the same general-purpose Claude Code engineer with the same tools and settings, so pick any idle " +
+      "worker and spread independent tasks across several of them. " +
+      "The user can add workers while you run; team_status always shows the current team, so check it before saying a worker does not exist.\n\n" +
       "Each task starts the member from a clean context, so every brief must be self-contained " +
       "(goal, relevant files, acceptance criteria, what earlier tasks found). " +
       "Handoffs arrive as messages starting with [Handoff from <member>, task #N]. " +
       "Members can message you at any time ([Message from <member>]); answer with message_member when they need something, " +
       "and do not reply to plain acknowledgements. " +
-      "Messages starting with [Task #N ...] are status notices from the system." +
-      (sharedCommands.length > 0
-        ? ` Members can run the user's slash commands (${sharedCommands.map((command) => `/${command.name}`).join(", ")}) when a brief or message asks them to.`
-        : "");
+      "Messages starting with [Task #N ...] are status notices from the system.\n\n" +
+      "You supervise running work actively; you are never limited to waiting for handoffs. " +
+      "The server watches every running task and wakes you with a [Watchdog] notice when a worker is blocked on the user's approval, " +
+      "has gone silent, or has worked a long time without a handoff. On a notice, or whenever the user asks how things are going, " +
+      "check team_status and member_activity, then act: tell the user about approvals only they can give, " +
+      "use interrupt_member to unstick or redirect a worker right away (message_member only arrives after its current turn), " +
+      "or stop_member and reassign the work. If the worker is making progress, leave it alone and say nothing to the user.\n\n" +
+      "When a worker asks the user to approve a tool call, you get an [Approval request <id> from <member>] notice with the call " +
+      "and the rules that run without asking. Check whether the same result is reachable without approval; if so, call " +
+      "redirect_approval with the exact route. If not, do nothing and do not tell the user yet: the request stays in their UI, " +
+      "and a [Watchdog] notice follows if it waits long. Never send a route that does less than the worker needs.\n\n" +
+      "When the user wants work done later (\"tomorrow at 9\", \"in 2 hours\", \"after the deploy window\"), use schedule_work " +
+      "instead of delegating now; check list_scheduled for the current time first if you need it. A [Scheduled work #N] message " +
+      "arrives when it is due; delegate it then. Use cancel_scheduled when the user calls it off. The user sees scheduled work " +
+      "in their task summary, so do not repeat it in chat beyond a one-line confirmation.\n\n" +
+      "You keep the team's long-term memory for this workspace with save_memory, the same memory Claude Code loads in every " +
+      "session here (the user's own sessions too). Save what a future session could not work out from the code or git history: " +
+      "gotchas and root causes from handoffs (their Learnings line), corrections and preferences the user states, how to run " +
+      "or verify things here, and project context such as deadlines or decisions. One fact per memory. Call list_memories " +
+      "first and update an existing memory (same name) rather than adding a duplicate; delete_memory one that proved wrong. " +
+      "Do not save what only matters to the current task. Workers may not have the newest memories loaded, so put the ones " +
+      "relevant to a task in its brief.\n\n" +
+      TASK_SUMMARY_NOTE;
   }
   const chromeNote = chrome
-    ? "\n\nYou can use Claude in Chrome (the user's real browser, with their logins). Other members may use it at the same time: " +
-      "always open your own tab with tabs_create_mcp, never act in tabs you did not create, and close your tabs when done."
+    ? "\n\nOther members may use Claude in Chrome at the same time: " +
+      "always open your own tab with tabs_create_mcp and never act in tabs you did not create. " +
+      "Before your handoff, close every tab you opened with tabs_close_mcp."
     : "";
-  return `${memberConfig.prompt}${chromeNote}${sharedCommandsNote()}\n\nYou are "${memberConfig.name}" on a team led by a Manager. ` +
-    "Messages starting with [Task #N from Manager] are assignments. Finish each assignment with a short handoff: " +
-    "Summary, Files changed, Open issues. Keep it under 15 lines; the Manager sees this final message automatically. " +
+  return `${ownPrompt}You are "${memberConfig.name}", a worker on a team led by a Manager.${chromeNote}\n\n` +
+    "Messages starting with [Task #N from Manager] are assignments. Finish each assignment with a short handoff with these lines: " +
+    "Problem (what was wrong and the root cause), Fix (what changed, main files), Commit (SHA and branch, or 'not committed'), " +
+    "Specs (command and result, or 'not run' and why), UI verification (what you checked in the browser and the result, " +
+    "or 'not done' and why), Open issues, Learnings (gotchas or non-obvious facts about this codebase a future task " +
+    "should know, or 'none'). Keep it under 20 lines; the Manager sees this final message automatically. " +
     "To reach the Manager at any other time (a question, a blocker, or when the user asks you to report), use the message_manager tool. " +
     "Messages starting with [Message from <manager>] come from the Manager; reply with message_manager if an answer is needed.";
 }
@@ -568,9 +839,9 @@ function argumentsFor(runtime: MemberRuntime): string[] {
     "--input-format", "stream-json",
     "--output-format", "stream-json",
     "--verbose", "--include-partial-messages",
-    "--model", memberConfig.model,
     "--append-system-prompt", systemPromptFor(runtime),
-    // Include your user settings so members get the same permissions, hooks and plugins as your terminal.
+    // The same settings, CLAUDE.md, skills, commands, hooks, plugins and MCP servers as your terminal;
+    // the team server is added on top.
     "--setting-sources", "user,project,local",
     "--mcp-config", JSON.stringify(mcpConfig),
     "--permission-mode", memberConfig.permissionMode ?? "acceptEdits",
@@ -578,18 +849,16 @@ function argumentsFor(runtime: MemberRuntime): string[] {
     // wait for the user's answer in the UI (see handlePermissionRequest).
     "--permission-prompt-tool", "stdio",
   ];
-  if (memberConfig.strictMcp) commandArguments.push("--strict-mcp-config");
+  // Unset model and effort follow your Claude Code defaults, like `claude` in a terminal.
+  if (memberConfig.model) commandArguments.push("--model", memberConfig.model);
   if (memberConfig.effort) commandArguments.push("--effort", memberConfig.effort);
-  if (memberConfig.autocompact) commandArguments.push("--autocompact", memberConfig.autocompact);
   if (memberConfig.tools) commandArguments.push("--tools", memberConfig.tools.join(","));
-  // Enabling Chrome also allows its tools, as when you run Claude in a terminal
-  // with Chrome; the extension's own per-site permissions still apply.
-  commandArguments.push(usesChrome(runtime) ? "--chrome" : "--no-chrome");
-  if (sharedCommands.length > 0) commandArguments.push("--plugin-dir", commandPluginDirectory);
+  // Enabling Chrome also allows its tools; the extension's own per-site permissions still apply.
+  // Off leaves your own Claude in Chrome setting in charge.
+  if (usesChrome(runtime)) commandArguments.push("--chrome");
   const allowedTools = [
     ...(memberConfig.allowedTools ?? []),
     ...runtime.team.allowedTools,
-    ...runtime.workspaceAllowedTools,
     "mcp__team",
     // Project skills ship helper scripts (e.g. .claude/skills/verify-rsu/scripts/*.sh); running them is part of the skill.
     ...skillScriptRules(runtime.team.workspace),
@@ -669,11 +938,14 @@ function ensureProcess(runtime: MemberRuntime): Subprocess<"pipe", "pipe", "pipe
 
   const child = Bun.spawn(argumentsFor(runtime), {
     cwd: runtime.team.workspace,
+    env: processEnvironment(),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
   });
   runtime.process = child;
+  runtime.billing = usesApiKey() ? "api" : "plan";
+  runtime.planLimitHit = false;
   runtime.restartPending = false;
   runtime.status = "starting";
   runtime.stderrTail = "";
@@ -719,17 +991,22 @@ function handleExit(runtime: MemberRuntime, child: Subprocess, exitCode: number 
 
   abandonPendingTurns(runtime, "stopped");
   runtime.permissionRequests = [];
+  runtime.openTabs = 0;
   runtime.status = "asleep";
   broadcastMember(runtime);
 }
 
 function abandonPendingTurns(runtime: MemberRuntime, status: "stopped" | "over_budget") {
+  runtime.queuedInputs = [];
   for (const origin of runtime.origins.splice(0)) {
     if (origin.kind !== "task" || origin.taskId === undefined) continue;
     const task = queries.findTask.get(origin.taskId);
     if (!task || task.status !== "running") continue;
     queries.finishTask.run(status, runtime.taskSpent, null, task.id);
-    notifyManager(runtime.team, `[Task #${task.id} for ${runtime.config.name} ${status.replace("_", " ")} after ${formatTokens(runtime.taskSpent)} tokens; no handoff was produced]`);
+    settleItem(runtime.team, task.item_id, status === "stopped" ? "stopped" : "failed");
+    notifyManager(runtime.team,
+      `[Task #${task.id} for ${runtime.config.name} ${status.replace("_", " ")} after ${formatTokens(runtime.taskSpent)} tokens; no handoff was produced]`,
+      task.item_id);
   }
   runtime.taskSpent = 0;
 }
@@ -742,22 +1019,39 @@ function stopMember(runtime: MemberRuntime, reason: "stopped" | "over_budget" = 
   child.kill();
 }
 
-// threadRoot: for a thread reply, the message being answered; it is quoted to the member.
+// quote: for a thread reply, what is being answered; the member sees it above the text, the UI does not.
 function sendTurn(runtime: MemberRuntime, text: string, origin: TurnOrigin, eventKind = "user", attachments: Attachment[] = [],
-  threadRoot: { id: number; text: string } | null = null) {
+  quote: string | null = null) {
   const child = ensureProcess(runtime);
   if (origin.kind === "task" && !runtime.origins.some((pending) => pending.kind === "task")) runtime.taskSpent = 0;
-  runtime.origins.push(threadRoot ? { ...origin, threadId: threadRoot.id } : origin);
+  if (runtime.origins.length === 0) startTurn(runtime);
+  runtime.origins.push(origin);
   if (runtime.status !== "compacting") runtime.status = "working";
   runtime.lastActiveAt = Date.now();
   // Only file names are stored; the file contents go to the member, not the database.
   const attachmentNote = attachments.length > 0 ? `\n\n[Attached: ${attachments.map((attachment) => attachment.name).join(", ")}]` : "";
-  recordEvent(runtime, eventKind, text + attachmentNote, threadRoot?.id ?? null);
-  const memberText = threadRoot ? `${threadQuote(threadRoot.text)}\n${text}` : expandSharedCommand(text);
+  recordEvent(runtime, eventKind, text + attachmentNote, placementFor(origin));
+  const memberText = quote ? `${quote}\n${text}` : text;
   const content = attachments.length > 0 ? [...attachments.map(contentBlockFor), { type: "text", text: memberText }] : memberText;
-  child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
-  child.stdin.flush();
+  writeTurnInput(runtime, child, JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
   broadcastMember(runtime);
+}
+
+// Call after pushing the turn's origin: the line goes out now if it is the only turn, else when the turns ahead end.
+function writeTurnInput(runtime: MemberRuntime, child: Subprocess<"pipe", "pipe", "pipe">, line: string) {
+  if (runtime.origins.length > 1) {
+    runtime.queuedInputs.push(line);
+    return;
+  }
+  child.stdin.write(line);
+  child.stdin.flush();
+}
+
+function writeNextQueuedInput(runtime: MemberRuntime) {
+  const line = runtime.queuedInputs.shift();
+  if (line === undefined || !runtime.process) return;
+  runtime.process.stdin.write(line);
+  runtime.process.stdin.flush();
 }
 
 function threadQuote(rootText: string): string {
@@ -809,19 +1103,391 @@ function validateAttachments(rawAttachments: unknown): Attachment[] {
 // Queues /clear like any other turn, so it runs after work already queued.
 function clearContext(runtime: MemberRuntime, note: string) {
   const child = ensureProcess(runtime);
+  if (runtime.origins.length === 0) startTurn(runtime);
   runtime.origins.push({ kind: "command" });
   if (runtime.status !== "compacting") runtime.status = "working";
   runtime.contextTokens = 0;
+  // After /clear the member no longer knows which tabs were its own.
+  runtime.openTabs = 0;
   recordEvent(runtime, "system", note);
-  child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: "/clear" } }) + "\n");
-  child.stdin.flush();
+  writeTurnInput(runtime, child, JSON.stringify({ type: "user", message: { role: "user", content: "/clear" } }) + "\n");
 }
 
-function notifyManager(team: Team, text: string) {
-  sendTurn(team.manager, text, { kind: "handoff" }, "handoff");
+function newWatchState(): WatchState {
+  return { approvalAlerts: new Set(), silentAlerts: 0, checkIns: 0 };
+}
+
+function startTurn(runtime: MemberRuntime) {
+  runtime.turnStartedAt = Date.now();
+  runtime.lastOutputAt = Date.now();
+  runtime.watch = newWatchState();
+}
+
+// itemId files the notice, and the Manager's handling of it, under that task summary item.
+function notifyManager(team: Team, text: string, itemId: number | null = null) {
+  sendTurn(team.manager, text, itemId === null ? { kind: "handoff" } : { kind: "handoff", itemId }, "handoff");
+}
+
+// ---------------------------------------------------------------- task summary items
+
+const MAX_ITEM_TITLE_CHARACTERS = 80;
+const MAX_ITEM_SUMMARY_CHARACTERS = 500;
+const MAX_ITEM_QUESTIONS = 10;
+const MAX_ITEM_QUESTION_CHARACTERS = 1000;
+const VISIBLE_ITEM_LIMIT = 100;
+const ITEM_STATUS_LABELS: Record<ItemStatus, string> = {
+  working: "working", needs_input: "needs input", done: "done", failed: "failed", stopped: "stopped",
+};
+
+function parseQuestions(json: string): string[] {
+  try {
+    const questions = JSON.parse(json);
+    return Array.isArray(questions) ? questions.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+// The details shown when the user opens an item, in display order.
+const ITEM_REPORT_FIELDS = [
+  ["problem", "Problem"], ["fix", "Fix"], ["commit", "Commit"], ["specs", "Specs"],
+  ["ui_verification", "UI verification"], ["notes", "Notes"],
+] as const;
+type ItemReport = Partial<Record<(typeof ITEM_REPORT_FIELDS)[number][0], string>>;
+const MAX_ITEM_REPORT_FIELD_CHARACTERS = 2000;
+
+function parseReport(json: string): ItemReport {
+  try {
+    const report = JSON.parse(json);
+    return report && typeof report === "object" && !Array.isArray(report) ? report : {};
+  } catch {
+    return {};
+  }
+}
+
+// Fields sent replace the stored ones; an empty string removes a field.
+function mergedReport(item: ItemRow, rawReport: unknown): ItemReport {
+  const report = parseReport(item.report);
+  if (rawReport === undefined) return report;
+  if (!rawReport || typeof rawReport !== "object" || Array.isArray(rawReport)) throw new Error("report must be an object.");
+  for (const [field] of ITEM_REPORT_FIELDS) {
+    if (!Object.hasOwn(rawReport, field)) continue;
+    const value = String((rawReport as Record<string, unknown>)[field] ?? "").trim().slice(0, MAX_ITEM_REPORT_FIELD_CHARACTERS);
+    if (value) report[field] = value;
+    else delete report[field];
+  }
+  return report;
+}
+
+function reportText(report: ItemReport): string {
+  // **Label:** renders bold in the chat, so each field stands out in the item's history.
+  const lines = ITEM_REPORT_FIELDS.filter(([field]) => report[field]).map(([field, label]) => `**${label}:** ${report[field]}`);
+  return lines.length > 0 ? `\n\n${lines.join("\n")}` : "";
+}
+
+function publicItem(item: ItemRow) {
+  return {
+    id: item.id, title: item.title, member: item.member, status: item.status, summary: item.summary,
+    questions: parseQuestions(item.questions), report: parseReport(item.report),
+    createdAt: item.created_at, updatedAt: item.updated_at,
+  };
+}
+
+function itemsFor(team: Team) {
+  return queries.visibleItems.all(team.workspace, VISIBLE_ITEM_LIMIT).map(publicItem);
+}
+
+function broadcastItems(team: Team) {
+  broadcast({ type: "items", workspace: team.workspace, items: itemsFor(team) });
+}
+
+function itemIdForTask(taskId: number | undefined): number | null {
+  if (taskId === undefined) return null;
+  return queries.findTask.get(taskId)?.item_id ?? null;
+}
+
+function saveItem(team: Team, item: ItemRow) {
+  queries.saveItem.run(item.member, item.status, item.summary, item.questions, item.report, item.archived, Date.now(), item.id);
+  broadcastItems(team);
+}
+
+// When the item's last running task ends, an item still marked working takes the task's outcome.
+// A status the Manager set (needs input, done, failed) is left alone.
+function settleItem(team: Team, itemId: number | null, outcome: "done" | "failed" | "stopped") {
+  if (itemId === null) return;
+  const item = queries.findItem.get(itemId, team.workspace);
+  if (!item || item.status !== "working") return;
+  if ((queries.runningTaskCount.get(itemId)?.count ?? 0) > 0) return;
+  saveItem(team, { ...item, status: outcome });
+}
+
+// "Item #12 rsu-23" plus a one-line title derived from the brief when the Manager gave none.
+function itemTitleFrom(title: unknown, brief: string): string {
+  const text = String(title ?? "").trim() || brief.split("\n").find((line) => line.trim())?.trim() || "Task";
+  return text.length > MAX_ITEM_TITLE_CHARACTERS ? `${text.slice(0, MAX_ITEM_TITLE_CHARACTERS - 3)}...` : text;
+}
+
+// The item a follow-up task continues, or null for new work (or an unknown task number).
+function followUpItemFor(team: Team, rawTaskId: unknown): ItemRow | null {
+  const itemId = Number.isInteger(rawTaskId) ? itemIdForTask(rawTaskId as number) : null;
+  return itemId === null ? null : queries.findItem.get(itemId, team.workspace) ?? null;
+}
+
+// A follow-up puts its item back to working and clears the questions it answers.
+function reopenItem(team: Team, item: ItemRow, memberName: string): ItemRow {
+  const reopenedItem = { ...item, member: memberName, status: "working" as ItemStatus, questions: "[]", archived: 0 };
+  saveItem(team, reopenedItem);
+  return reopenedItem;
+}
+
+function createItem(team: Team, taskId: number, memberName: string, brief: string, title: unknown): ItemRow {
+  queries.insertItem.run(taskId, team.workspace, itemTitleFrom(title, brief), memberName, Date.now());
+  queries.assignTaskItem.run(taskId, taskId);
+  broadcastItems(team);
+  return queries.findItem.get(taskId, team.workspace)!;
+}
+
+// The Manager's report on an item: the only way its updates reach the user's task summary.
+function updateItem(team: Team, input: any): string {
+  const taskId = Number(input?.task);
+  const itemId = Number.isInteger(taskId) ? itemIdForTask(taskId) : null;
+  const item = itemId === null ? null : queries.findItem.get(itemId, team.workspace);
+  if (!item) throw new Error("Unknown task. Pass the number of a task you delegated (any task on the item).");
+
+  const status = input?.status === undefined ? item.status : String(input.status) as ItemStatus;
+  if (!ITEM_STATUSES_FOR_MANAGER.includes(status) && status !== item.status) {
+    throw new Error(`status must be one of: ${ITEM_STATUSES_FOR_MANAGER.join(", ")}`);
+  }
+  const summary = input?.summary === undefined
+    ? item.summary
+    : String(input.summary).replace(/\s+/g, " ").trim().slice(0, MAX_ITEM_SUMMARY_CHARACTERS);
+  let questions = parseQuestions(item.questions);
+  if (input?.questions !== undefined) {
+    if (!Array.isArray(input.questions)) throw new Error("questions must be a list of strings.");
+    questions = input.questions.map((question: unknown) => String(question).trim()).filter(Boolean);
+    if (questions.length > MAX_ITEM_QUESTIONS) throw new Error(`Ask at most ${MAX_ITEM_QUESTIONS} questions per item.`);
+    questions = questions.map((question) => question.slice(0, MAX_ITEM_QUESTION_CHARACTERS));
+  }
+  if (status === "needs_input" && questions.length === 0) throw new Error("needs_input requires at least one question.");
+  const report = mergedReport(item, input?.report);
+
+  saveItem(team, { ...item, status, summary, questions: JSON.stringify(questions), report: JSON.stringify(report) });
+  const questionText = questions.length > 0 ? `\n\n${questions.map((question, index) => `q${index + 1}: ${question}`).join("\n")}` : "";
+  recordEvent(team.manager, "item",
+    `[${item.title}: ${ITEM_STATUS_LABELS[status]}]\n${summary}${reportText(report)}${questionText}`, { itemId: item.id });
+  return `Item #${item.id} (${item.title}) updated: ${ITEM_STATUS_LABELS[status]}.`;
+}
+
+// Quoted to the Manager above a reply the user sent in an item's thread.
+function itemQuote(item: ItemRow): string {
+  const questions = parseQuestions(item.questions);
+  const questionText = questions.length > 0
+    ? ` Open questions:\n${questions.map((question, index) => `q${index + 1}: ${question}`).join("\n")}`
+    : "";
+  return `[Thread reply about item #${item.id} "${item.title}" (${ITEM_STATUS_LABELS[item.status]}, ${item.member}).${questionText}]`;
+}
+
+// ---------------------------------------------------------------- scheduled work
+
+const MAX_SCHEDULE_INSTRUCTION_CHARACTERS = 20_000;
+const MAX_SCHEDULE_DELAY_MILLISECONDS = 366 * 24 * 60 * 60_000;
+const VISIBLE_SCHEDULE_LIMIT = 100;
+const DUE_SCHEDULE_BATCH = 20;
+const SCHEDULE_SWEEP_INTERVAL_MS = 15_000;
+// A schedule that comes due this much later than planned (the server was down) says so.
+const LATE_SCHEDULE_MILLISECONDS = 2 * 60_000;
+
+function formatLocalTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString("en-US", {
+    weekday: "short", year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short",
+  });
+}
+
+function currentTimeNote(): string {
+  return `Current time: ${formatLocalTime(Date.now())} (${new Date().toISOString()}).`;
+}
+
+function publicSchedule(schedule: ScheduleRow) {
+  return { id: schedule.id, title: schedule.title, instructions: schedule.instructions, runAt: schedule.run_at, createdAt: schedule.created_at };
+}
+
+function schedulesFor(team: Team) {
+  return queries.pendingSchedules.all(team.workspace, VISIBLE_SCHEDULE_LIMIT).map(publicSchedule);
+}
+
+function broadcastSchedules(team: Team) {
+  broadcast({ type: "schedules", workspace: team.workspace, schedules: schedulesFor(team) });
+}
+
+// run_at (an ISO 8601 time; without an offset it is the server's local time) or delay_minutes from now.
+function scheduledTimeFrom(input: any, now: number): number {
+  const hasRunAt = input?.run_at !== undefined && String(input.run_at).trim() !== "";
+  const hasDelay = input?.delay_minutes !== undefined;
+  if (hasRunAt === hasDelay) throw new Error(`Pass exactly one of run_at or delay_minutes. ${currentTimeNote()}`);
+  const runAt = hasRunAt
+    ? new Date(String(input.run_at).trim()).getTime()
+    : now + Number(input.delay_minutes) * 60_000;
+  if (!Number.isFinite(runAt)) throw new Error(`run_at must be an ISO 8601 time such as 2026-10-17T09:00. ${currentTimeNote()}`);
+  if (runAt <= now) throw new Error(`That time is not in the future. ${currentTimeNote()}`);
+  if (runAt - now > MAX_SCHEDULE_DELAY_MILLISECONDS) throw new Error("Schedule at most a year ahead.");
+  return runAt;
+}
+
+function scheduleWork(team: Team, input: any): string {
+  const instructions = String(input?.instructions ?? "").trim();
+  if (!instructions) throw new Error("instructions is required");
+  if (instructions.length > MAX_SCHEDULE_INSTRUCTION_CHARACTERS) throw new Error("instructions must be under 20,000 characters.");
+  const now = Date.now();
+  const runAt = scheduledTimeFrom(input, now);
+  const title = itemTitleFrom(input?.title, instructions);
+  const scheduleId = queries.insertSchedule.get(team.workspace, title, instructions, runAt, now)!.id;
+  broadcastSchedules(team);
+  return `Scheduled #${scheduleId} "${title}" for ${formatLocalTime(runAt)}. At that time you get a [Scheduled work #${scheduleId}] ` +
+    `message with these instructions; delegate it then. ${currentTimeNote()}`;
+}
+
+function listScheduled(team: Team): string {
+  const schedules = queries.pendingSchedules.all(team.workspace, VISIBLE_SCHEDULE_LIMIT);
+  const lines = schedules.map((schedule) =>
+    `#${schedule.id} ${formatLocalTime(schedule.run_at)}: ${schedule.title}\n  ${schedule.instructions.replace(/\s+/g, " ").slice(0, ACTIVITY_EVENT_CHARACTERS)}`);
+  return [currentTimeNote(), ...(lines.length > 0 ? lines : ["No scheduled work."])].join("\n");
+}
+
+function cancelSchedule(team: Team, rawScheduleId: unknown): ScheduleRow {
+  const schedule = queries.settleSchedule.get("cancelled", Number(rawScheduleId), team.workspace);
+  if (!schedule) throw new Error(`No pending scheduled work #${rawScheduleId} in this workspace.`);
+  broadcastSchedules(team);
+  return schedule;
+}
+
+// Wakes each due schedule's Manager once. Schedules missed while the server was down fire on the first sweep.
+function runDueSchedules() {
+  const now = Date.now();
+  for (const dueSchedule of queries.dueSchedules.all(now, DUE_SCHEDULE_BATCH)) {
+    let workspace: string;
+    try {
+      workspace = validateWorkspace(dueSchedule.workspace);
+    } catch (error) {
+      queries.settleSchedule.run("cancelled", dueSchedule.id, dueSchedule.workspace);
+      console.warn(`Dropping scheduled work #${dueSchedule.id}: ${(error as Error).message}`);
+      continue;
+    }
+    const schedule = queries.settleSchedule.get("fired", dueSchedule.id, dueSchedule.workspace);
+    if (!schedule) continue;
+    const team = teamFor(workspace);
+    const lateNote = now - schedule.run_at >= LATE_SCHEDULE_MILLISECONDS
+      ? ` (due ${formatLocalTime(schedule.run_at)}; the server was not running then)`
+      : "";
+    notifyManager(team, `[Scheduled work #${schedule.id} "${schedule.title}", set for ${formatLocalTime(schedule.run_at)}${lateNote}]\n` +
+      `${schedule.instructions}\n\nDo it now: delegate it with delegate_task (title "${schedule.title}").`);
+    broadcastSchedules(team);
+  }
+}
+
+// ---------------------------------------------------------------- memories
+
+// The workspace's Claude Code memory: one Markdown file per memory plus a MEMORY.md index,
+// which Claude Code loads at the start of every session in the workspace.
+const MEMORY_TYPES = ["user", "feedback", "project", "reference"];
+const MEMORY_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const MEMORY_INDEX_FILE = "MEMORY.md";
+const MAX_MEMORY_DESCRIPTION_CHARACTERS = 200;
+const MAX_MEMORY_CONTENT_CHARACTERS = 5_000;
+// Claude Code only loads the start of a long index.
+const MEMORY_INDEX_WARNING_LINES = 150;
+
+function memoryDirectoryFor(workspace: string): string {
+  const claudeDirectory = process.env.CLAUDE_CONFIG_DIR ? expandPath(process.env.CLAUDE_CONFIG_DIR) : join(homedir(), ".claude");
+  return join(claudeDirectory, "projects", workspace.replace(/[^A-Za-z0-9]/g, "-"), "memory");
+}
+
+function memoryNameFrom(rawName: unknown): string {
+  const name = String(rawName ?? "").trim();
+  if (!MEMORY_NAME_PATTERN.test(name) || name === "memory") {
+    throw new Error("name must be a short kebab-case slug, e.g. rspec-needs-redis.");
+  }
+  return name;
+}
+
+function singleLine(value: unknown, limit: number): string {
+  return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+function writeFileAtomically(path: string, contents: string) {
+  const temporaryPath = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporaryPath, contents);
+  renameSync(temporaryPath, path);
+}
+
+function readMemoryIndex(memoryDirectory: string): string[] {
+  const indexPath = join(memoryDirectory, MEMORY_INDEX_FILE);
+  if (!existsSync(indexPath)) return [];
+  return readFileSync(indexPath, "utf8").split("\n").filter((line) => line.trim());
+}
+
+function indexLinesWithout(indexLines: string[], name: string): string[] {
+  return indexLines.filter((line) => !line.includes(`](${name}.md)`));
+}
+
+function saveMemory(team: Team, input: any): string {
+  const name = memoryNameFrom(input?.name);
+  const type = String(input?.type ?? "");
+  if (!MEMORY_TYPES.includes(type)) throw new Error(`type must be one of: ${MEMORY_TYPES.join(", ")}`);
+  const title = singleLine(input?.title, MAX_ITEM_TITLE_CHARACTERS) || name;
+  const description = singleLine(input?.description, MAX_MEMORY_DESCRIPTION_CHARACTERS);
+  if (!description) throw new Error("description is required");
+  const content = String(input?.content ?? "").trim();
+  if (!content) throw new Error("content is required");
+  if (content.length > MAX_MEMORY_CONTENT_CHARACTERS) throw new Error("content must be under 5,000 characters; keep one fact per memory.");
+
+  const memoryDirectory = memoryDirectoryFor(team.workspace);
+  mkdirSync(memoryDirectory, { recursive: true });
+  const memoryPath = join(memoryDirectory, `${name}.md`);
+  const updating = existsSync(memoryPath);
+  // JSON strings are valid YAML scalars, so any description is safe in the frontmatter.
+  writeFileAtomically(memoryPath, [
+    "---", `name: ${name}`, `description: ${JSON.stringify(description)}`, "metadata:", `  type: ${type}`,
+    `  modified: ${new Date().toISOString()}`, "  savedBy: vdev manager", "---", "", content, "",
+  ].join("\n"));
+
+  const indexLines = [...indexLinesWithout(readMemoryIndex(memoryDirectory), name), `- [${title}](${name}.md) - ${description}`];
+  writeFileAtomically(join(memoryDirectory, MEMORY_INDEX_FILE), indexLines.join("\n") + "\n");
+  recordEvent(team.manager, "system", `${updating ? "Updated" : "Saved"} memory: ${title} - ${description}`);
+  const sizeWarning = indexLines.length > MEMORY_INDEX_WARNING_LINES
+    ? ` The index has ${indexLines.length} lines; Claude Code loads only the start of it, so merge or delete stale memories.`
+    : "";
+  return `${updating ? "Updated" : "Saved"} memory ${name} (${type}). New sessions in this workspace load it.${sizeWarning}`;
+}
+
+function listMemories(team: Team): string {
+  const indexLines = readMemoryIndex(memoryDirectoryFor(team.workspace));
+  return indexLines.length > 0 ? indexLines.join("\n") : "No memories saved for this workspace yet.";
+}
+
+function readMemory(team: Team, rawName: unknown): string {
+  const memoryPath = join(memoryDirectoryFor(team.workspace), `${memoryNameFrom(rawName)}.md`);
+  if (!existsSync(memoryPath)) throw new Error(`No memory named ${rawName}. list_memories shows the saved ones.`);
+  return readFileSync(memoryPath, "utf8");
+}
+
+function deleteMemory(team: Team, rawName: unknown): string {
+  const name = memoryNameFrom(rawName);
+  const memoryDirectory = memoryDirectoryFor(team.workspace);
+  const memoryPath = join(memoryDirectory, `${name}.md`);
+  const indexLines = readMemoryIndex(memoryDirectory);
+  const remainingLines = indexLinesWithout(indexLines, name);
+  if (!existsSync(memoryPath) && remainingLines.length === indexLines.length) throw new Error(`No memory named ${name}.`);
+  if (existsSync(memoryPath)) unlinkSync(memoryPath);
+  writeFileAtomically(join(memoryDirectory, MEMORY_INDEX_FILE), remainingLines.length > 0 ? remainingLines.join("\n") + "\n" : "");
+  recordEvent(team.manager, "system", `Deleted memory: ${name}`);
+  return `Deleted memory ${name}.`;
 }
 
 // ---------------------------------------------------------------- stream-json handling
+
+// Lines that show the model or a tool moved on; system notices (status, hooks, background
+// task progress) keep arriving while a member is stuck, so they do not count.
+const PROGRESS_LINE_TYPES = new Set(["stream_event", "assistant", "user", "result"]);
 
 function handleLine(runtime: MemberRuntime, line: string) {
   let data: any;
@@ -831,6 +1497,7 @@ function handleLine(runtime: MemberRuntime, line: string) {
     return;
   }
   runtime.lastActiveAt = Date.now();
+  if (PROGRESS_LINE_TYPES.has(data.type)) runtime.lastOutputAt = Date.now();
 
   switch (data.type) {
     case "system":
@@ -844,6 +1511,7 @@ function handleLine(runtime: MemberRuntime, line: string) {
       break;
     case "rate_limit_event":
       rateLimit = data.rate_limit_info ?? null;
+      if (rateLimit?.status === "rejected") runtime.planLimitHit = true;
       broadcast({ type: "rate", rateLimit });
       break;
     case "result":
@@ -884,7 +1552,7 @@ function handleControlRequest(runtime: MemberRuntime, data: any) {
 
   const rule = browser ? siteRule ?? suggestedRules[0] ?? toolName : suggestedRule(toolName, input);
   // A rule another member saved after this process launched; the CLI only reads rules at launch.
-  if (!browser && coveredBySharedRule(runtime.team, toolName, input, rule)) {
+  if (!browser && coveredBySharedRule(runtime.team, toolName, input)) {
     writeControlResponse(runtime, {
       subtype: "success", request_id: data.request_id,
       response: { behavior: "allow", updatedInput: input, updatedPermissions: sessionGrants([rule]) },
@@ -900,7 +1568,7 @@ function handleControlRequest(runtime: MemberRuntime, data: any) {
     return;
   }
 
-  runtime.permissionRequests.push({
+  const permissionRequest: PermissionRequest = {
     requestId: String(data.request_id),
     toolName,
     input,
@@ -910,8 +1578,50 @@ function handleControlRequest(runtime: MemberRuntime, data: any) {
     grantRules,
     toolUseId: request.tool_use_id ? String(request.tool_use_id) : null,
     createdAt: Date.now(),
-  });
+  };
+  runtime.permissionRequests.push(permissionRequest);
   broadcastMember(runtime);
+  if (reviewApprovals && !browser && !isManager(runtime)) askManagerToReview(runtime, permissionRequest);
+}
+
+const REVIEW_RULE_LIMIT = 60;
+
+// The Manager often knows a route that needs no approval (the Read tool instead of cat, a
+// command without a cd prefix or pipe). It can only send the worker that way, never approve:
+// the request stays in the UI for the user until one of them answers it.
+function askManagerToReview(runtime: MemberRuntime, request: PermissionRequest) {
+  const task = currentTask(runtime);
+  const label = task ? `${runtime.config.name} (task #${task.id})` : runtime.config.name;
+  const allowRules = [...new Set([
+    ...(runtime.config.allowedTools ?? []),
+    ...runtime.team.allowedTools,
+    ...projectAllowRules(runtime.team.workspace),
+  ])];
+  const shownRules = allowRules.slice(0, REVIEW_RULE_LIMIT).join(", ") || "(none)";
+  const moreRules = allowRules.length > REVIEW_RULE_LIMIT ? ` and ${allowRules.length - REVIEW_RULE_LIMIT} more` : "";
+  notifyManager(runtime.team,
+    `[Approval request ${request.requestId} from ${label}]\n` +
+    `Waits for the user's approval: ${request.summary}\n` +
+    `Allowed without asking: ${shownRules}${moreRules}\n` +
+    "If the same result is reachable without approval, call redirect_approval with this request id and the exact route. " +
+    "If it is not, do nothing: the request stays with the user.",
+    task?.item_id ?? null);
+}
+
+// Denies the call with the Manager's route as its result; the worker reads it and goes on in the same turn.
+function redirectApproval(runtime: MemberRuntime, requestId: string, text: string): string {
+  const request = runtime.permissionRequests.find((pending) => pending.requestId === requestId);
+  if (!request) {
+    throw new Error(`${runtime.config.name} no longer waits for approval ${requestId}: the user answered it or the step ended. Do nothing.`);
+  }
+  if (request.toolUseId) runtime.deniedByUser.add(request.toolUseId);
+  dropPermissionRequest(runtime, requestId);
+  writeControlResponse(runtime, {
+    subtype: "success", request_id: requestId,
+    response: { behavior: "deny", message: `The Manager answered this instead of asking the user. Do not retry the same call. ${text}` },
+  });
+  recordEvent(runtime, "system", `Redirected by the Manager: ${request.summary.split("\n").pop()}\n${text}`);
+  return `Redirected ${runtime.config.name}; it continues with your route now.`;
 }
 
 // The rtk hook turns every find into "rtk find", which no allow rule can safely cover
@@ -924,21 +1634,32 @@ function isReadOnlyRtkFind(command: string): boolean {
   return !FIND_ACTION_FLAGS.test(command);
 }
 
-// True when the rule vdev would suggest for this call is one already shared with every
-// member. Only for a single plain command: a prefix rule like Bash(bundle exec rspec *)
+// True when a rule shared with every member covers this call, e.g. Bash(rtk ls *) covers
+// "rtk ls captures". Only for a single plain command: a prefix rule like Bash(bundle exec rspec *)
 // must never approve "bundle exec rspec; rm -rf tmp", which Claude Code itself would refuse.
-function coveredBySharedRule(team: Team, toolName: string, input: Record<string, unknown>, rule: string): boolean {
-  if (!team.sharePermissions || !team.allowedTools.includes(rule)) return false;
-  if (toolName !== "Bash") return rule === toolName;
-  return !/[;&|`$<>()\\\n]/.test(String(input.command ?? ""));
+function coveredBySharedRule(team: Team, toolName: string, input: Record<string, unknown>): boolean {
+  if (toolName !== "Bash") return team.allowedTools.includes(toolName);
+  const command = String(input.command ?? "").trim();
+  if (/[;&|`$<>()\\\n]/.test(command)) return false;
+  return team.allowedTools.some((rule) => bashRuleCovers(rule, command));
 }
 
-// Rules you wrote (member, Project settings, per member) that cover a Chrome
+// "Bash(git diff *)" and "Bash(git diff:*)" cover "git diff" and "git diff HEAD"; "Bash(git diff)" only "git diff".
+function bashRuleCovers(rule: string, command: string): boolean {
+  const match = rule.match(/^Bash\((.+?)( \*|:\*)?\)$/);
+  if (!match) return false;
+  const [, prefix, wildcard] = match;
+  if (prefix.includes("*")) return false;
+  if (!wildcard) return command === prefix;
+  return command === prefix || command.startsWith(`${prefix} `);
+}
+
+// Rules you wrote (worker settings, project permissions) that cover a Chrome
 // action: its tool name, the CLI's suggested rule (e.g. ClaudeInChromeDomain(localhost)),
 // ClaudeInChromeDomain(*) for every site, or mcp__claude-in-chrome for everything.
 // The mcp__claude-in-chrome rule vdev adds itself for Chrome members does not count.
 function browserActionAllowed(runtime: MemberRuntime, toolName: string, grantRules: string[]): boolean {
-  const rules = new Set([...(runtime.config.allowedTools ?? []), ...runtime.team.allowedTools, ...runtime.workspaceAllowedTools]);
+  const rules = new Set([...(runtime.config.allowedTools ?? []), ...runtime.team.allowedTools]);
   if (rules.has("mcp__claude-in-chrome") || rules.has("mcp__claude-in-chrome__*") || rules.has(toolName)) return true;
   if (grantRules.length === 0) return false;
   return grantRules.every((rule) => rules.has(rule) || (rule.startsWith("ClaudeInChromeDomain(") && rules.has("ClaudeInChromeDomain(*)")));
@@ -963,9 +1684,8 @@ function writeControlResponse(runtime: MemberRuntime, response: Record<string, u
   runtime.process.stdin.flush();
 }
 
-// "always" also saves the suggested rule, so later calls like it run without
-// asking (now and after restarts): for this member in this workspace, or for
-// Chrome sites, for every member in this workspace.
+// "always" also saves the suggested rule for every member in this workspace, so
+// later calls like it run without asking (now and after restarts).
 function answerPermission(runtime: MemberRuntime, requestId: string, decision: "allow" | "always" | "deny") {
   const request = runtime.permissionRequests.find((pending) => pending.requestId === requestId);
   if (!request) return;
@@ -987,16 +1707,12 @@ function answerPermission(runtime: MemberRuntime, requestId: string, decision: "
     allowResponse.updatedPermissions = request.browser && request.grantRules.length > 0
       ? sessionGrants(request.grantRules)
       : [{ type: "addRules", rules: [ruleValueFor(request.rule)], behavior: "allow", destination: "session" }];
-    if (request.browser || runtime.team.sharePermissions) saveProjectRule(runtime.team, request.rule);
-    else saveMemberRule(runtime, request.rule);
+    saveProjectRule(runtime.team, request.rule);
   }
   writeControlResponse(runtime, { subtype: "success", request_id: requestId, response: allowResponse });
   if (decision === "allow") return recordEvent(runtime, "system", `Allowed once: ${summaryLine}`);
-  const shared = request.browser || runtime.team.sharePermissions;
-  recordEvent(runtime, "system", shared
-    ? `Allowed: ${summaryLine}\nSaved rule ${request.rule} for all members in this workspace.`
-    : `Allowed: ${summaryLine}\nSaved rule ${request.rule} for ${runtime.config.name} in this workspace.`);
-  if (shared && !request.browser) allowPendingRequestsCoveredBy(runtime.team, request.rule);
+  recordEvent(runtime, "system", `Allowed: ${summaryLine}\nSaved rule ${request.rule} for all members in this workspace.`);
+  if (!request.browser) allowPendingRequestsCoveredBy(runtime.team, request.rule);
 }
 
 // One click for a whole team blocked on approvals: each pending call runs once,
@@ -1011,8 +1727,8 @@ function allowAllPermissions(team: Team) {
 function allowPendingRequestsCoveredBy(team: Team, rule: string) {
   for (const otherRuntime of team.runtimes.values()) {
     for (const pending of [...otherRuntime.permissionRequests]) {
-      if (pending.browser || pending.rule !== rule) continue;
-      if (!coveredBySharedRule(team, pending.toolName, pending.input, rule)) continue;
+      if (pending.browser) continue;
+      if (!coveredBySharedRule(team, pending.toolName, pending.input)) continue;
       dropPermissionRequest(otherRuntime, pending.requestId);
       writeControlResponse(otherRuntime, {
         subtype: "success", request_id: pending.requestId,
@@ -1033,17 +1749,8 @@ function ruleValueFor(rule: string): { toolName: string; ruleContent?: string } 
 function saveProjectRule(team: Team, rule: string) {
   if (team.allowedTools.includes(rule)) return;
   team.allowedTools = [...team.allowedTools, rule];
-  queries.saveProjectSettings.run(team.workspace, team.instructions, JSON.stringify(team.allowedTools), team.chrome ? 1 : 0,
-    team.sharePermissions ? 1 : 0);
+  queries.saveProjectSettings.run(team.workspace, team.instructions, JSON.stringify(team.allowedTools));
   broadcast({ type: "projectSettings", workspace: team.workspace, ...projectSettingsFor(team) });
-}
-
-function saveMemberRule(runtime: MemberRuntime, rule: string) {
-  if (runtime.workspaceAllowedTools.includes(rule)) return;
-  runtime.workspaceAllowedTools = [...runtime.workspaceAllowedTools, rule];
-  queries.savePermissions.run(runtime.config.name, runtime.team.workspace, JSON.stringify(runtime.workspaceAllowedTools),
-    runtime.projectChrome === null ? null : runtime.projectChrome ? 1 : 0);
-  broadcast({ type: "projectSettings", workspace: runtime.team.workspace, ...projectSettingsFor(runtime.team) });
 }
 
 function handleSystem(runtime: MemberRuntime, data: any) {
@@ -1087,7 +1794,10 @@ function flushDelta(runtime: MemberRuntime) {
   if (runtime.deltaTimer) clearTimeout(runtime.deltaTimer);
   runtime.deltaTimer = null;
   if (!runtime.pendingDelta) return;
-  broadcast({ type: "delta", workspace: runtime.team.workspace, member: runtime.config.name, text: runtime.pendingDelta, threadId: currentThreadId(runtime) });
+  broadcast({
+    type: "delta", workspace: runtime.team.workspace, member: runtime.config.name, text: runtime.pendingDelta,
+    placement: currentPlacement(runtime),
+  });
   runtime.pendingDelta = "";
 }
 
@@ -1106,15 +1816,25 @@ function addTaskSpend(runtime: MemberRuntime, tokens: number) {
 
 function handleAssistant(runtime: MemberRuntime, data: any) {
   const isSubagent = Boolean(data.parent_tool_use_id);
-  const threadId = currentThreadId(runtime);
+  const placement = currentPlacement(runtime);
   for (const block of data.message?.content ?? []) {
     if (block.type === "text" && block.text?.trim() && !isSubagent) {
       flushDelta(runtime);
-      recordEvent(runtime, "assistant", block.text, threadId);
+      recordEvent(runtime, "assistant", block.text, placement);
     } else if (block.type === "tool_use") {
-      recordEvent(runtime, "tool", summarizeToolUse(block.name, block.input ?? {}), threadId);
+      recordEvent(runtime, "tool", summarizeToolUse(block.name, block.input ?? {}), toolPlacement(block, placement));
+      countTabs(runtime, block.name);
     }
   }
+}
+
+// An update_item call is filed under the item it updates, whichever item or thread the turn is about.
+function toolPlacement(block: any, turnPlacement: EventPlacement): EventPlacement {
+  if (block.name !== "mcp__team__update_item") return turnPlacement;
+  const taskId = Number(block.input?.task);
+  const itemId = Number.isInteger(taskId) ? itemIdForTask(taskId) : null;
+  if (itemId === null) return turnPlacement;
+  return { threadId: null, itemId, origin: turnPlacement.origin };
 }
 
 function summarizeToolUse(toolName: string, input: Record<string, unknown>): string {
@@ -1123,9 +1843,35 @@ function summarizeToolUse(toolName: string, input: Record<string, unknown>): str
   return `${label}  ${String(detail).replace(/\s+/g, " ").slice(0, 200)}`;
 }
 
+function countTabs(runtime: MemberRuntime, toolName: string) {
+  if (toolName === "mcp__claude-in-chrome__tabs_create_mcp") runtime.openTabs += 1;
+  if (toolName === "mcp__claude-in-chrome__tabs_close_mcp") runtime.openTabs = Math.max(runtime.openTabs - 1, 0);
+}
+
+// A worker that hands off with its tabs still open gets one more turn to close them,
+// unless other work is queued: the next task's /clear would make it forget which tabs were its own.
+function closeLeftoverTabs(runtime: MemberRuntime, taskId: number) {
+  if (isManager(runtime) || runtime.openTabs === 0) return;
+  const tabCount = runtime.openTabs;
+  runtime.openTabs = 0;
+  if (runtime.origins.length > 0) {
+    recordEvent(runtime, "error", `Task #${taskId} ended with ${tabCount} Chrome tab(s) still open; close them in Chrome.`);
+    return;
+  }
+  sendTurn(runtime,
+    `[System] Task #${taskId} is handed off, but you left ${tabCount} Chrome tab(s) open. ` +
+    "Close every tab you opened with tabs_close_mcp now. Do nothing else, and reply with one line when done.",
+    { kind: "handoff" }, "system");
+}
+
 function handleResult(runtime: MemberRuntime, data: any) {
+  if (retryOnApiKey(runtime, data)) return;
   flushDelta(runtime);
   const origin = runtime.origins.shift();
+  if (runtime.origins.length > 0) startTurn(runtime);
+  writeNextQueuedInput(runtime);
+  const interrupted = runtime.interrupting;
+  runtime.interrupting = false;
   const usage = data.usage ?? {};
   queries.insertUsage.run(runtime.config.name, usage.input_tokens ?? 0, usage.output_tokens ?? 0,
     usage.cache_read_input_tokens ?? 0, usage.cache_creation_input_tokens ?? 0, Date.now());
@@ -1138,21 +1884,27 @@ function handleResult(runtime: MemberRuntime, data: any) {
     recordEvent(runtime, "error",
       `Permission denied: ${summarizeToolUse(denial.tool_name ?? "tool", denial.tool_input ?? {})}\n` +
       `To allow it, add a rule such as ${suggestedRule(denial.tool_name ?? "tool", denial.tool_input ?? {})} ` +
-      "in Project settings (this workspace) or Edit member (every workspace).");
+      "under Settings, in this project's permissions or the worker settings (every project).");
   }
 
   runtime.deniedByUser.clear();
 
-  if (data.is_error && data.subtype !== "success") {
+  if (interrupted) {
+    recordEvent(runtime, "system", "Interrupted by the Manager.");
+  } else if (data.is_error && data.subtype !== "success") {
     recordEvent(runtime, "error", `Turn ended: ${data.subtype}${data.result ? `\n${data.result}` : ""}`);
   }
 
-  if (origin?.kind === "task" && origin.taskId !== undefined) {
+  // An interrupted task goes on in the Manager's follow-up turn, which brings the handoff.
+  if (origin?.kind === "task" && origin.taskId !== undefined && !interrupted) {
     const failed = Boolean(data.is_error);
     queries.finishTask.run(failed ? "failed" : "done", runtime.taskSpent, data.result ?? null, origin.taskId);
+    const itemId = itemIdForTask(origin.taskId);
+    settleItem(runtime.team, itemId, failed ? "failed" : "done");
     const header = `[Handoff from ${runtime.config.name}, task #${origin.taskId}${failed ? ", FAILED" : ""}, ${formatTokens(runtime.taskSpent)} tokens]`;
-    notifyManager(runtime.team, `${header}\n${data.result || "(no summary returned)"}`);
+    notifyManager(runtime.team, `${header}\n${data.result || "(no summary returned)"}`, itemId);
     runtime.taskSpent = 0;
+    closeLeftoverTabs(runtime, origin.taskId);
   }
 
   runtime.status = runtime.origins.length > 0 ? "working" : "idle";
@@ -1195,10 +1947,6 @@ function formatTokens(tokens: number): string {
 
 // ---------------------------------------------------------------- MCP server (team tools)
 
-function workerNames(): string[] {
-  return workerConfigs().map((worker) => worker.name);
-}
-
 const messageTextSchema = { type: "string", description: "The message. Be specific and brief." };
 // No enum: Claude Code caches tool schemas at launch, so an enum would reject members
 // added while the Manager is running. callMcpTool checks the name against the live roster.
@@ -1237,15 +1985,146 @@ const managerMcpTools = () => [
   {
     name: "delegate_task",
     description: "Assign a task to a team member. Returns at once; the member's handoff arrives later as a message " +
-      "starting with [Handoff from <member>, task #N]. Tasks for the same member run in order.",
+      "starting with [Handoff from <member>, task #N]. Tasks for the same member run in order. " +
+      "While it runs, [Watchdog] notices report a blocked or stalled worker; member_activity shows its progress at any time.",
     inputSchema: {
       type: "object",
       properties: {
         member: memberNameSchema,
         brief: { type: "string", description: "What to do, acceptance criteria, and relevant files." },
+        title: {
+          type: "string",
+          description: "Short label for the user's task summary, e.g. the ticket key (RSU-23) or a few words (Airbrake NoMethodError in checkout).",
+        },
+        follows_up: {
+          type: "integer",
+          description: "Task number this continues (a fix, a follow-up after the user's answer). Keeps it on that task's summary item " +
+            "instead of adding a new one, and clears the item's open questions.",
+        },
         budget_tokens: { type: "integer", description: "Optional token budget. Defaults to the member's budget." },
       },
-      required: ["member", "brief"],
+      required: ["member", "brief", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "update_item",
+    description: "Update an item on the user's task summary, the list of everything they asked for, in order. " +
+      "This is how your reports reach the user: they do not see handoffs, worker messages, watchdog notices or your replies to them. " +
+      "Use it when an item is done or failed (a one-line summary), when it needs the user's decision (status needs_input with " +
+      "one question per decision), or when the user's answers settle its questions (questions: []).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: { type: "integer", description: "Any task number on the item (the first task or a follow-up)." },
+        status: { type: "string", enum: ITEM_STATUSES_FOR_MANAGER, description: "Leave out to keep the current status." },
+        summary: { type: "string", description: "One line the user reads in the list, e.g. 'Fixed; spec added in spec/models/rsu_spec.rb'." },
+        report: {
+          type: "object",
+          description: "The full details the user sees when they open the item. Fill every field that applies when an item is " +
+            "done or failed; fields you send replace earlier ones, and an empty string removes one.",
+          properties: {
+            problem: { type: "string", description: "What the bug or request was, and its root cause." },
+            fix: { type: "string", description: "What was changed, with the main files." },
+            commit: { type: "string", description: "Commit SHA(s) and branch, or 'not committed'." },
+            specs: { type: "string", description: "Spec status: command run and result (e.g. 'passed: bin/rspec spec/models/rsu_spec.rb, 14 examples'), or 'not run' and why." },
+            ui_verification: { type: "string", description: "UI verification status: what was checked in the browser and the result, or 'not done' and why." },
+            notes: { type: "string", description: "Anything else the user should know: follow-ups, risks, open issues." },
+          },
+          additionalProperties: false,
+        },
+        questions: {
+          type: "array",
+          items: { type: "string" },
+          description: "Replaces the item's open questions. Each is one decision the user must make, short and self-contained. [] clears them.",
+        },
+      },
+      required: ["task"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "schedule_work",
+    description: "Set work to start later. At the chosen time you receive a [Scheduled work #N] message with the instructions, " +
+      "and delegate it then (pick an idle worker at that time). The user sees pending scheduled work on their task summary. " +
+      "Times without an offset are the server's local time; the result shows the current time.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short label for the user's task summary, as for delegate_task." },
+        instructions: {
+          type: "string",
+          description: "What to do when it is due: everything you will need then (goal, files, acceptance criteria, which worker if it matters).",
+        },
+        run_at: { type: "string", description: "When to start, ISO 8601, e.g. 2026-10-17T09:00 or 2026-10-17T09:00:00-07:00." },
+        delay_minutes: { type: "number", description: "Or: start this many minutes from now. Pass run_at or delay_minutes, not both." },
+      },
+      required: ["title", "instructions"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_scheduled",
+    description: "The current time and the scheduled work that has not started yet, soonest first.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "cancel_scheduled",
+    description: "Cancel scheduled work that has not started yet.",
+    inputSchema: {
+      type: "object",
+      properties: { schedule: { type: "integer", description: "The number from schedule_work or list_scheduled." } },
+      required: ["schedule"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "save_memory",
+    description: "Save or update a long-term memory for this workspace: a learning, gotcha, user preference or project fact " +
+      "that future sessions should know. It goes into Claude Code's memory for the workspace, which every new session here " +
+      "loads (yours, the workers', and the user's own). Saving an existing name replaces that memory.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Kebab-case slug, also the file name, e.g. rspec-needs-redis." },
+        title: { type: "string", description: "Short title for the index, e.g. 'Specs need Redis running'." },
+        description: { type: "string", description: "One line used to judge relevance later, e.g. 'bin/rspec fails with ECONNREFUSED unless redis-server runs'." },
+        type: {
+          type: "string", enum: MEMORY_TYPES,
+          description: "user: who the user is and how they work. feedback: a correction or confirmed approach. " +
+            "project: ongoing work, decisions, deadlines (absolute dates). reference: where to find things outside the repo.",
+        },
+        content: {
+          type: "string",
+          description: "The fact. For feedback and project memories, follow it with **Why:** and **How to apply:** lines.",
+        },
+      },
+      required: ["name", "title", "description", "type", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_memories",
+    description: "The workspace's memory index: one line per saved memory, with its name (the .md file) and description.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "read_memory",
+    description: "The full text of one saved memory.",
+    inputSchema: {
+      type: "object",
+      properties: { name: { type: "string", description: "The memory's name, as in list_memories." } },
+      required: ["name"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "delete_memory",
+    description: "Delete a memory that turned out to be wrong or no longer applies.",
+    inputSchema: {
+      type: "object",
+      properties: { name: { type: "string", description: "The memory's name, as in list_memories." } },
+      required: ["name"],
       additionalProperties: false,
     },
   },
@@ -1253,6 +2132,50 @@ const managerMcpTools = () => [
     name: "team_status",
     description: "Every member's state, current task, queue length and tokens spent against budget.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "member_activity",
+    description: "What a member has been doing: current task, how long it has run, time since its last output, " +
+      "approvals it waits for, and its most recent tool calls and messages. Use it to judge whether a worker is progressing, " +
+      "looping, or stuck, instead of waiting for the handoff.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        member: memberNameSchema,
+        limit: { type: "integer", description: `How many recent events to show (default ${ACTIVITY_DEFAULT_LIMIT}, at most ${ACTIVITY_MAX_LIMIT}).` },
+      },
+      required: ["member"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "interrupt_member",
+    description: "Interrupt what a member is doing right now (a hung command, a wrong approach, a tool call waiting for approval) " +
+      "and give it new instructions at once. Its current task stays open and the handoff still arrives as usual. " +
+      "Unlike message_member, it does not wait for the current turn to end.",
+    inputSchema: {
+      type: "object",
+      properties: { member: memberNameSchema, text: messageTextSchema },
+      required: ["member", "text"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "redirect_approval",
+    description: "Answer an [Approval request] from a worker with a route that needs no approval, e.g. the Read, Grep or Glob tool " +
+      "instead of cat, grep or find; the command without a cd prefix, pipe or && chain; or a command an allow rule already covers. " +
+      "The call is denied and the worker gets your text as its result at once and carries on. " +
+      "You cannot approve calls: when no such route exists, leave the request for the user.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        member: memberNameSchema,
+        request: { type: "string", description: "The request id from the [Approval request <id> ...] notice." },
+        text: { type: "string", description: "The exact route to take instead, e.g. the command or tool call to run." },
+      },
+      required: ["member", "request", "text"],
+      additionalProperties: false,
+    },
   },
   {
     name: "stop_member",
@@ -1277,28 +2200,50 @@ function callMcpTool(caller: MemberRuntime, toolName: string, input: any): strin
   if (toolName === "message_manager") {
     const text = String(input?.text ?? "").trim();
     if (!text) throw new Error("text is required");
-    notifyManager(team, `[Message from ${caller.config.name}]\n${text}`);
+    notifyManager(team, `[Message from ${caller.config.name}]\n${text}`, currentTask(caller)?.item_id ?? null);
     return "Sent to the Manager. Continue your work; any answer arrives as a message.";
   }
 
   if (toolName === "team_status") {
-    return workerConfigs().map((worker) => {
-      const member = publicMember(team.runtimes.get(worker.name)!);
-      const taskText = member.task
-        ? `task #${member.task.id} (${formatTokens(member.task.spent)}/${formatTokens(member.task.budget)})`
-        : "no task";
-      return `${member.name}: ${member.status}, ${taskText}, ${member.queued} queued`;
-    }).join("\n");
+    return teamConfig.workers.map((workerName) => statusLineFor(team.runtimes.get(workerName)!)).join("\n");
+  }
+
+  if (toolName === "update_item") return updateItem(team, input);
+  if (toolName === "schedule_work") return scheduleWork(team, input);
+  if (toolName === "list_scheduled") return listScheduled(team);
+  if (toolName === "save_memory") return saveMemory(team, input);
+  if (toolName === "list_memories") return listMemories(team);
+  if (toolName === "read_memory") return readMemory(team, input?.name);
+  if (toolName === "delete_memory") return deleteMemory(team, input?.name);
+  if (toolName === "cancel_scheduled") {
+    const schedule = cancelSchedule(team, input?.schedule);
+    return `Cancelled scheduled work #${schedule.id} "${schedule.title}".`;
   }
 
   const runtime = team.runtimes.get(input?.member);
-  if (!runtime || isManager(runtime)) throw new Error(`Unknown member. Use one of: ${workerNames().join(", ")}`);
+  if (!runtime || isManager(runtime)) throw new Error(`Unknown member. Use one of: ${teamConfig.workers.join(", ")}`);
 
   if (toolName === "message_member") {
     const text = String(input?.text ?? "").trim();
     if (!text) throw new Error("text is required");
     sendTurn(runtime, `[Message from ${caller.config.name}]\n${text}`, { kind: "handoff" }, "handoff");
     return `Sent to ${runtime.config.name}. Their reply, if any, arrives as a message.`;
+  }
+
+  if (toolName === "member_activity") {
+    return activityReportFor(runtime, input?.limit);
+  }
+
+  if (toolName === "interrupt_member") {
+    const text = String(input?.text ?? "").trim();
+    if (!text) throw new Error("text is required");
+    return interruptMember(runtime, caller, text);
+  }
+
+  if (toolName === "redirect_approval") {
+    const text = String(input?.text ?? "").trim();
+    if (!text) throw new Error("text is required");
+    return redirectApproval(runtime, String(input?.request ?? ""), text);
   }
 
   if (toolName === "stop_member") {
@@ -1311,15 +2256,166 @@ function callMcpTool(caller: MemberRuntime, toolName: string, input: any): strin
     const budget = Number.isInteger(input.budget_tokens) && input.budget_tokens > 0
       ? input.budget_tokens
       : runtime.config.budget ?? DEFAULT_BUDGET;
-    const taskId = queries.insertTask.get(team.workspace, runtime.config.name, brief, budget, Date.now())!.id;
+    const followUpItem = followUpItemFor(team, input.follows_up);
+    if (input.follows_up !== undefined && !followUpItem) throw new Error(`follows_up: no task #${input.follows_up} in this workspace.`);
+    const taskId = queries.insertTask.get(team.workspace, runtime.config.name, brief, budget, Date.now(), followUpItem?.id ?? null)!.id;
+    const item = followUpItem
+      ? reopenItem(team, followUpItem, runtime.config.name)
+      : createItem(team, taskId, runtime.config.name, brief, input.title);
     // Every task starts from a clean context; the brief must say everything needed.
     clearContext(runtime, `Context cleared for task #${taskId}.`);
     sendTurn(runtime, `[Task #${taskId} from Manager]\n${brief}`, { kind: "task", taskId }, "task");
     const position = runtime.origins.filter((origin) => origin.kind === "task").length - 1;
     return `Task #${taskId} assigned to ${runtime.config.name} (budget ${formatTokens(budget)} tokens` +
-      `${position > 0 ? `, ${position} ahead in queue` : ""}). The handoff will arrive as a message.`;
+      `${position > 0 ? `, ${position} ahead in queue` : ""}), on summary item #${item.id} "${item.title}". ` +
+      "The handoff will arrive as a message.";
   }
   throw new Error(`Unknown tool ${toolName}`);
+}
+
+function formatDuration(milliseconds: number): string {
+  const minutes = Math.floor(milliseconds / 60_000);
+  if (minutes < 1) return `${Math.max(Math.floor(milliseconds / 1000), 0)}s`;
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+// "worker3: working, task #12 (40k/250k), 14m on this turn, last output 3m ago, waits 4m for approval: Bash ..., 0 queued"
+function statusLineFor(runtime: MemberRuntime): string {
+  const member = publicMember(runtime);
+  const parts = [member.status];
+  parts.push(member.task ? `task #${member.task.id} (${formatTokens(member.task.spent)}/${formatTokens(member.task.budget)})` : "no task");
+  if (runtime.origins.length > 0) {
+    const now = Date.now();
+    parts.push(`${formatDuration(now - runtime.turnStartedAt)} on this turn`, `last output ${formatDuration(now - runtime.lastOutputAt)} ago`);
+    const oldestRequest = runtime.permissionRequests[0];
+    if (oldestRequest) {
+      parts.push(`waits ${formatDuration(now - oldestRequest.createdAt)} for the user's approval: ${oldestRequest.summary.split("\n").pop()}`);
+    }
+  }
+  parts.push(`${member.queued} queued`);
+  return `${member.name}: ${parts.join(", ")}`;
+}
+
+const ACTIVITY_DEFAULT_LIMIT = 15;
+const ACTIVITY_MAX_LIMIT = 50;
+const ACTIVITY_EVENT_CHARACTERS = 300;
+
+function recentActivity(runtime: MemberRuntime, limit: number) {
+  return queries.recentEvents.all(runtime.team.workspace, runtime.config.name, limit);
+}
+
+function lastToolCall(runtime: MemberRuntime): string | null {
+  const lastTool = recentActivity(runtime, 10).findLast((event) => event.kind === "tool");
+  return lastTool ? lastTool.text.slice(0, ACTIVITY_EVENT_CHARACTERS) : null;
+}
+
+function activityReportFor(runtime: MemberRuntime, rawLimit: unknown): string {
+  const limit = Number.isInteger(rawLimit) && (rawLimit as number) > 0
+    ? Math.min(rawLimit as number, ACTIVITY_MAX_LIMIT)
+    : ACTIVITY_DEFAULT_LIMIT;
+  const now = Date.now();
+  const lines = [statusLineFor(runtime)];
+  const task = currentTask(runtime);
+  if (task) lines.push(`Task #${task.id} brief: ${task.brief.replace(/\s+/g, " ").slice(0, ACTIVITY_EVENT_CHARACTERS)}`);
+  for (const request of runtime.permissionRequests) {
+    lines.push(`Waiting ${formatDuration(now - request.createdAt)} for the user's approval: ${request.summary.replace(/\s+/g, " ")}`);
+  }
+  lines.push("", "Recent events, oldest first:");
+  for (const event of recentActivity(runtime, limit)) {
+    const text = event.text.replace(/\s+/g, " ");
+    const shortText = text.length > ACTIVITY_EVENT_CHARACTERS ? `${text.slice(0, ACTIVITY_EVENT_CHARACTERS)}...` : text;
+    lines.push(`${formatDuration(now - event.created_at)} ago [${event.kind}] ${shortText}`);
+  }
+  return lines.join("\n");
+}
+
+// Stops the current turn at once (the CLI cancels the running tool) and sends the text as the next turn.
+// The follow-up takes over the interrupted turn's origin, so an interrupted task ends with the follow-up's handoff.
+function interruptMember(runtime: MemberRuntime, caller: MemberRuntime, text: string): string {
+  const name = runtime.config.name;
+  const origin = runtime.origins[0];
+  if (!runtime.process || !origin) throw new Error(`${name} is not working on anything. Use message_member or delegate_task.`);
+  if (origin.kind === "command") throw new Error(`${name} is clearing or compacting its context; try again in a moment.`);
+  if (runtime.interrupting) throw new Error(`${name} is already being interrupted; your earlier message reaches it first.`);
+  // The follow-up runs after anything already queued, so a queued task (with its /clear) would run first.
+  if (runtime.origins.slice(1).some((queued) => queued.kind === "task" || queued.kind === "command")) {
+    throw new Error(`${name} has tasks queued behind the current one, which would run before your message. ` +
+      "Use stop_member and delegate again instead.");
+  }
+
+  for (const request of [...runtime.permissionRequests]) {
+    if (request.toolUseId) runtime.deniedByUser.add(request.toolUseId);
+    dropPermissionRequest(runtime, request.requestId);
+    writeControlResponse(runtime, {
+      subtype: "success", request_id: request.requestId,
+      response: { behavior: "deny", message: "The Manager interrupted this step; new instructions follow." },
+    });
+  }
+  runtime.interrupting = true;
+  runtime.process.stdin.write(JSON.stringify({
+    type: "control_request", request_id: `interrupt-${crypto.randomUUID()}`, request: { subtype: "interrupt" },
+  }) + "\n");
+  runtime.process.stdin.flush();
+
+  const followUpOrigin: TurnOrigin = origin.kind === "task" ? { kind: "task", taskId: origin.taskId } : { kind: "handoff" };
+  const taskNote = origin.kind === "task" ? ` Task #${origin.taskId} is still yours: finish it with the usual handoff.` : "";
+  sendTurn(runtime, `[Message from ${caller.config.name}, interrupting your last step]${taskNote}\n${text}`, followUpOrigin, "handoff");
+  return `Interrupted ${name} and sent your message; it acts on it now.`;
+}
+
+// The Manager only runs when a message reaches it, so the server watches running tasks and
+// wakes it with one [Watchdog] notice per sweep when a worker is blocked, silent or slow.
+// A sweep about a single task summary item is filed under that item.
+function watchTeam(team: Team) {
+  const watched = teamConfig.workers
+    .map((workerName) => team.runtimes.get(workerName))
+    .filter((runtime): runtime is MemberRuntime => Boolean(runtime?.process))
+    .map((runtime) => ({ note: watchNoteFor(runtime, Date.now()), itemId: currentTask(runtime)?.item_id ?? null }))
+    .filter((entry): entry is { note: string; itemId: number | null } => entry.note !== null);
+  if (watched.length === 0) return;
+  const itemIds = new Set(watched.map((entry) => entry.itemId));
+  const itemId = itemIds.size === 1 ? watched[0].itemId : null;
+  notifyManager(team, `[Watchdog]\n${watched.map((entry) => entry.note).join("\n")}`, itemId);
+}
+
+function watchNoteFor(runtime: MemberRuntime, now: number): string | null {
+  const task = currentTask(runtime);
+  if (!task) return null;
+  const watch = runtime.watch;
+  const label = `${runtime.config.name} (task #${task.id})`;
+
+  if (approvalAlertMilliseconds > 0) {
+    const newlyStuck = runtime.permissionRequests.filter((request) =>
+      now - request.createdAt >= approvalAlertMilliseconds && !watch.approvalAlerts.has(request.requestId));
+    if (newlyStuck.length > 0) {
+      for (const request of newlyStuck) watch.approvalAlerts.add(request.requestId);
+      const waits = newlyStuck.map((request) => request.summary.split("\n").pop()).join("; ");
+      return `${label} is blocked: it has waited ${formatDuration(now - newlyStuck[0].createdAt)} for the user to approve ${waits}. ` +
+        "Only the user can approve it in the vdev UI. Tell the user, or use interrupt_member to have the worker take another route.";
+    }
+  }
+  // Already reported; the worker is waiting for the user, not stalling.
+  if (runtime.permissionRequests.length > 0) return null;
+
+  const silentFor = now - runtime.lastOutputAt;
+  if (silentFor < silentAlertMilliseconds) watch.silentAlerts = 0;
+  if (silentAlertMilliseconds > 0 && silentFor >= silentAlertMilliseconds * 2 ** watch.silentAlerts) {
+    watch.silentAlerts += 1;
+    const lastTool = lastToolCall(runtime);
+    return `${label} has produced no output for ${formatDuration(silentFor)}` +
+      `${lastTool ? `; its last tool call was: ${lastTool}` : ""}. It may be stuck on a long or hung command. ` +
+      "Check member_activity, then wait, interrupt_member to redirect it, or stop_member and reassign.";
+  }
+
+  const workingFor = now - runtime.turnStartedAt;
+  if (checkInMilliseconds > 0 && workingFor >= checkInMilliseconds * (watch.checkIns + 1)) {
+    watch.checkIns = Math.floor(workingFor / checkInMilliseconds);
+    return `${label} has worked ${formatDuration(workingFor)} without a handoff, ` +
+      `${formatTokens(runtime.taskSpent)}/${formatTokens(task.budget)} tokens spent. ` +
+      "Check member_activity to see whether it is progressing; act only if it is looping or off track.";
+  }
+  return null;
 }
 
 function handleMcpMessage(caller: MemberRuntime, message: any) {
@@ -1355,13 +2451,15 @@ async function handleMcpRequest(caller: MemberRuntime, request: Request): Promis
   return Response.json(Array.isArray(body) ? replies : replies[0]);
 }
 
-// ---------------------------------------------------------------- member configuration
+// ---------------------------------------------------------------- team configuration
 
-const MEMBER_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+const WORKER_NAME_PREFIX = "worker";
 const MODEL_PATTERN = /^[A-Za-z0-9._\-\[\]]{1,80}$/;
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 const PERMISSION_MODES = ["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"];
 const MAX_PROMPT_CHARACTERS = 20_000;
+const MAX_RULES = 100;
+const MAX_INSTRUCTION_CHARACTERS = 20_000;
 
 function optionalText(value: unknown): string | undefined {
   const text = String(value ?? "").trim();
@@ -1376,54 +2474,57 @@ function toolList(value: unknown, label: string): string[] | undefined {
   return tools.length > 0 ? tools : undefined;
 }
 
-// Builds a clean MemberConfig from browser input. Throws with a message suitable for the UI.
-function validateMemberConfig(raw: any, existingConfig: MemberConfig | undefined): MemberConfig {
-  const name = existingConfig?.name ?? String(raw?.name ?? "").trim();
-  if (!existingConfig) {
-    if (!MEMBER_NAME_PATTERN.test(name)) throw new Error("Name must start with a letter and use only a-z, 0-9, - or _ (max 32).");
-    if (teamConfig.members.some((memberConfig) => memberConfig.name === name)) throw new Error(`A member named "${name}" already exists.`);
+function validateRules(value: unknown, label: string): string[] {
+  const rules = toolList(value, label) ?? [];
+  if (rules.length > MAX_RULES) throw new Error(`${label}: at most ${MAX_RULES} rules.`);
+  return rules;
+}
+
+function assignOptional<Key extends keyof AgentConfig>(agentConfig: AgentConfig, key: Key, value: AgentConfig[Key] | undefined) {
+  if (value === undefined) delete agentConfig[key];
+  else agentConfig[key] = value;
+}
+
+// Applies only the fields the settings page sent, so fields it does not show
+// (e.g. the manager's tools) keep their team.json value. Throws with a message suitable for the UI.
+function validateAgentConfig(raw: any, existingConfig: AgentConfig, label: string): AgentConfig {
+  if (!raw || typeof raw !== "object") throw new Error(`${label} settings are missing.`);
+  const sent = (field: string) => Object.hasOwn(raw, field);
+  const agentConfig: AgentConfig = { ...existingConfig };
+
+  if (sent("model")) {
+    const model = optionalText(raw.model);
+    if (model && !MODEL_PATTERN.test(model)) throw new Error(`${label} model must be an alias like sonnet or a full model ID.`);
+    assignOptional(agentConfig, "model", model);
   }
-
-  const managing = existingConfig ? isManagerConfig(existingConfig) : false;
-  const role = managing ? "manager" : String(raw?.role ?? "").trim();
-  if (!role || role.length > 120) throw new Error("Role is required (max 120 characters).");
-  if (!managing && role === "manager") throw new Error("There can only be one manager.");
-
-  const model = String(raw?.model ?? "").trim();
-  if (!MODEL_PATTERN.test(model)) throw new Error("Model is required, e.g. sonnet, opus, haiku or a full model ID.");
-
-  const prompt = String(raw?.prompt ?? "").trim();
-  if (!prompt) throw new Error("Prompt is required.");
-  if (prompt.length > MAX_PROMPT_CHARACTERS) throw new Error("Prompt must be under 20,000 characters.");
-
-  const effort = optionalText(raw?.effort);
-  if (effort && !EFFORT_LEVELS.includes(effort)) throw new Error(`Effort must be one of: ${EFFORT_LEVELS.join(", ")}.`);
-
-  const permissionMode = optionalText(raw?.permissionMode);
-  if (permissionMode && !PERMISSION_MODES.includes(permissionMode)) {
-    throw new Error(`Permission mode must be one of: ${PERMISSION_MODES.join(", ")}.`);
+  if (sent("effort")) {
+    const effort = optionalText(raw.effort);
+    if (effort && !EFFORT_LEVELS.includes(effort)) throw new Error(`${label} effort must be one of: ${EFFORT_LEVELS.join(", ")}.`);
+    assignOptional(agentConfig, "effort", effort);
   }
-
-  let budget: number | undefined;
-  if (optionalText(raw?.budget)) {
-    budget = Number(raw.budget);
-    if (!Number.isInteger(budget) || budget < 1000) throw new Error("Budget must be a whole number of at least 1000 tokens.");
+  if (sent("permissionMode")) {
+    const permissionMode = optionalText(raw.permissionMode);
+    if (permissionMode && !PERMISSION_MODES.includes(permissionMode)) {
+      throw new Error(`${label} permission mode must be one of: ${PERMISSION_MODES.join(", ")}.`);
+    }
+    assignOptional(agentConfig, "permissionMode", permissionMode);
   }
-
-  const autocompact = optionalText(raw?.autocompact);
-  if (autocompact && autocompact.length > 40) throw new Error("Autocompact setting is too long.");
-
-  const memberConfig: MemberConfig = { name, role, model, prompt };
-  if (effort) memberConfig.effort = effort;
-  if (permissionMode) memberConfig.permissionMode = permissionMode;
-  if (budget) memberConfig.budget = budget;
-  if (autocompact) memberConfig.autocompact = autocompact;
-  if (raw?.chrome === true) memberConfig.chrome = true;
-  const tools = toolList(raw?.tools, "Available tools");
-  if (tools) memberConfig.tools = tools;
-  const allowedTools = toolList(raw?.allowedTools, "Allowed tools");
-  if (allowedTools) memberConfig.allowedTools = allowedTools;
-  return memberConfig;
+  if (sent("budget")) {
+    const budgetText = optionalText(raw.budget);
+    const budget = budgetText ? Number(budgetText) : undefined;
+    if (budget !== undefined && (!Number.isInteger(budget) || budget < 1000)) {
+      throw new Error(`${label} task budget must be a whole number of at least 1000 tokens.`);
+    }
+    assignOptional(agentConfig, "budget", budget);
+  }
+  if (sent("prompt")) {
+    const prompt = optionalText(raw.prompt);
+    if (prompt && prompt.length > MAX_PROMPT_CHARACTERS) throw new Error(`${label} instructions must be under 20,000 characters.`);
+    assignOptional(agentConfig, "prompt", prompt);
+  }
+  if (sent("allowedTools")) assignOptional(agentConfig, "allowedTools", toolList(raw.allowedTools, `${label} allowed tools`));
+  if (sent("chrome")) assignOptional(agentConfig, "chrome", raw.chrome === true ? true : undefined);
+  return agentConfig;
 }
 
 // Written to a temporary file first so a crash never leaves a half-written team.json.
@@ -1441,75 +2542,54 @@ function requestRestart(runtime: MemberRuntime) {
   else runtime.restartPending = true;
 }
 
-// The Manager's roster and delegate_task tool list are fixed at launch.
+// The Manager's worker list is fixed at launch.
 function restartManagers() {
   for (const team of teams.values()) requestRestart(team.manager);
 }
 
-// copyPermissionsFrom: for a new member made from a template, also copy the
-// template's per-workspace permissions and Chrome overrides from Project settings.
-function saveMember(raw: any, copyPermissionsFrom?: unknown) {
-  const existingIndex = teamConfig.members.findIndex((memberConfig) => memberConfig.name === raw?.originalName);
-  const existingConfig = existingIndex >= 0 ? teamConfig.members[existingIndex] : undefined;
-  if (raw?.originalName && !existingConfig) throw new Error("That member no longer exists.");
-  const memberConfig = validateMemberConfig(raw, existingConfig);
+// worker1, worker2, ...: the first numbered name not taken yet.
+function addWorker(): string {
+  const takenNames = new Set(memberNames());
+  let number = 1;
+  while (takenNames.has(`${WORKER_NAME_PREFIX}${number}`)) number += 1;
+  const name = `${WORKER_NAME_PREFIX}${number}`;
 
-  if (existingConfig) teamConfig.members[existingIndex] = memberConfig;
-  else teamConfig.members.push(memberConfig);
+  teamConfig.workers.push(name);
   saveTeamConfig();
-
-  const template = teamConfig.members.find((candidate) => candidate.name === copyPermissionsFrom);
-  if (!existingConfig && template && !isManagerConfig(template)) {
-    queries.deletePermissions.run(memberConfig.name);
-    queries.copyPermissions.run(memberConfig.name, template.name);
-  }
-
-  for (const team of teams.values()) {
-    const runtime = team.runtimes.get(memberConfig.name);
-    if (!runtime) {
-      addRuntime(team, memberConfig);
-      continue;
-    }
-    runtime.config = memberConfig;
-    requestRestart(runtime);
-  }
-  if (!existingConfig || existingConfig.role !== memberConfig.role) restartManagers();
+  // A worker that once had this name may have left a session behind.
+  queries.deleteSessions.run(name);
+  for (const team of teams.values()) addRuntime(team, memberConfigFor(name));
+  restartManagers();
+  return name;
 }
 
-// Sidebar order is team.json's member order. The manager keeps its slot; only
-// workers move. Order is cosmetic, so nothing restarts.
-function reorderMembers(raw: unknown) {
+// Sidebar order is team.json's worker order; the manager always comes first.
+// Order is cosmetic, so nothing restarts.
+function reorderWorkers(raw: unknown) {
   if (!Array.isArray(raw)) throw new Error("Member order must be a list of names.");
   const requestedOrder = raw.map(String);
-  const currentWorkers = workerNames();
-  const isPermutation = requestedOrder.length === currentWorkers.length &&
+  const isPermutation = requestedOrder.length === teamConfig.workers.length &&
     new Set(requestedOrder).size === requestedOrder.length &&
-    requestedOrder.every((name) => currentWorkers.includes(name));
+    requestedOrder.every((name) => teamConfig.workers.includes(name));
   if (!isPermutation) throw new Error("The member list changed; reload and try again.");
-
-  const configsByName = new Map(teamConfig.members.map((memberConfig) => [memberConfig.name, memberConfig]));
-  const remainingWorkers = requestedOrder.map((name) => configsByName.get(name)!);
-  teamConfig.members = teamConfig.members.map((memberConfig) =>
-    isManagerConfig(memberConfig) ? memberConfig : remainingWorkers.shift()!
-  );
+  teamConfig.workers = requestedOrder;
   saveTeamConfig();
 }
 
-function removeMember(memberName: string) {
-  const index = teamConfig.members.findIndex((memberConfig) => memberConfig.name === memberName);
-  if (index < 0) throw new Error("That member no longer exists.");
-  if (isManagerConfig(teamConfig.members[index])) throw new Error("The manager cannot be removed.");
+function removeWorker(workerName: string) {
+  if (workerName === MANAGER_NAME) throw new Error("The manager cannot be removed.");
+  const index = teamConfig.workers.indexOf(workerName);
+  if (index < 0) throw new Error("That worker no longer exists.");
 
-  teamConfig.members.splice(index, 1);
+  teamConfig.workers.splice(index, 1);
   saveTeamConfig();
-  // A member added later under the same name starts with a fresh session.
-  queries.deleteSessions.run(memberName);
-  queries.deletePermissions.run(memberName);
+  // A worker added later under the same name starts with a fresh session.
+  queries.deleteSessions.run(workerName);
   for (const team of teams.values()) {
-    const runtime = team.runtimes.get(memberName);
+    const runtime = team.runtimes.get(workerName);
     if (!runtime) continue;
     stopSilently(runtime);
-    team.runtimes.delete(memberName);
+    team.runtimes.delete(workerName);
   }
   restartManagers();
 }
@@ -1521,17 +2601,19 @@ function snapshot() {
   const team = projectDirectory ? teamFor(projectDirectory) : null;
   return {
     type: "snapshot",
+    clientVersion: clientVersion(),
     workspace: projectDirectory,
     workspaceName: projectDirectory ? basename(projectDirectory) : null,
     recentWorkspaces: recent,
     candidateWorkspaces: candidateWorkspaces().filter((path) => !recent.includes(path)),
     activeWorkspaces: activeWorkspaces(),
     projectSettings: team ? projectSettingsFor(team) : null,
-    memberConfigs: teamConfig.members,
+    teamSettings: teamSettings(),
+    apiSettings: apiSettings(),
     rateLimit,
-    members: team
-      ? teamConfig.members.map((memberConfig) => publicMember(team.runtimes.get(memberConfig.name)!))
-      : [],
+    members: team ? memberNames().map((name) => publicMember(team.runtimes.get(name)!)) : [],
+    items: team ? itemsFor(team) : [],
+    schedules: team ? schedulesFor(team) : [],
   };
 }
 
@@ -1570,6 +2652,7 @@ function stopSilently(runtime: MemberRuntime) {
   for (const origin of runtime.origins) {
     if (origin.kind === "task" && origin.taskId !== undefined) {
       queries.finishTask.run("stopped", runtime.taskSpent, null, origin.taskId);
+      settleItem(runtime.team, itemIdForTask(origin.taskId), "stopped");
     }
   }
   const child = runtime.process;
@@ -1578,27 +2661,26 @@ function stopSilently(runtime: MemberRuntime) {
   if (runtime.deltaTimer) clearTimeout(runtime.deltaTimer);
   Object.assign(runtime, {
     origins: [], status: "asleep", taskSpent: 0, warnedTaskId: null, pendingDelta: "", deltaTimer: null,
-    restartPending: false, permissionRequests: [],
+    restartPending: false, permissionRequests: [], openTabs: 0,
   });
 }
 
 function changeMembers(socket: ServerWebSocket<unknown>, message: any) {
   try {
-    if (message.type === "saveMember") saveMember(message.config, message.copyPermissionsFrom);
-    else removeMember(String(message.name ?? ""));
+    if (message.type === "addWorker") socket.send(JSON.stringify({ type: "workerAdded", name: addWorker() }));
+    else removeWorker(String(message.name ?? ""));
   } catch (error) {
-    socket.send(JSON.stringify({ type: "memberError", message: (error as Error).message }));
+    socket.send(JSON.stringify({ type: "sendError", message: (error as Error).message }));
     return;
   }
-  socket.send(JSON.stringify({ type: "memberSaved" }));
   broadcast(snapshot());
 }
 
 // A full snapshot would wipe every browser's loaded histories and unread
 // markers, so a reorder only sends the new order (or the unchanged one on error).
-function reorderMembersFrom(socket: ServerWebSocket<unknown>, order: unknown) {
+function reorderWorkersFrom(socket: ServerWebSocket<unknown>, order: unknown) {
   try {
-    reorderMembers(order);
+    reorderWorkers(order);
   } catch (error) {
     socket.send(JSON.stringify({ type: "memberOrderError", message: (error as Error).message }));
     socket.send(JSON.stringify(memberOrderMessage()));
@@ -1608,77 +2690,65 @@ function reorderMembersFrom(socket: ServerWebSocket<unknown>, order: unknown) {
 }
 
 function memberOrderMessage() {
-  return { type: "memberOrder", order: teamConfig.members.map((memberConfig) => memberConfig.name) };
+  return { type: "memberOrder", order: memberNames() };
 }
 
-const MAX_RULES = 100;
-const MAX_INSTRUCTION_CHARACTERS = 20_000;
-
-function validateRules(value: unknown, label: string): string[] {
-  const rules = toolList(value, label) ?? [];
-  if (rules.length > MAX_RULES) throw new Error(`${label}: at most ${MAX_RULES} rules.`);
-  return rules;
-}
-
-// Applies the Project settings page. Only members whose effective settings
-// changed are restarted (idle ones now, busy ones after their current work).
-function saveProjectSettings(socket: ServerWebSocket<unknown>, team: Team, message: any) {
-  let instructions: string;
-  let allowedTools: string[];
-  const memberChanges = new Map<MemberRuntime, { allowedTools: string[]; chrome: boolean | null }>();
+// Applies the Settings page: worker and manager settings (every project, team.json)
+// and, when a workspace is open, its project rules. Only members whose launch
+// settings changed are restarted (idle ones now, busy ones after their current work).
+function saveSettings(socket: ServerWebSocket<unknown>, team: Team | undefined, message: any) {
+  let managerConfig: AgentConfig;
+  let workerConfig: AgentConfig;
+  let instructions = "";
+  let allowedTools: string[] = [];
   try {
-    instructions = String(message.instructions ?? "").trim();
-    if (instructions.length > MAX_INSTRUCTION_CHARACTERS) throw new Error("Project rules must be under 20,000 characters.");
-    allowedTools = validateRules(message.allowedTools, "Permissions for all members");
-    for (const [memberName, memberSettings] of Object.entries<any>(message.members ?? {})) {
-      const runtime = team.runtimes.get(memberName);
-      if (!runtime) throw new Error(`Unknown member ${memberName}; reload the page.`);
-      memberChanges.set(runtime, {
-        allowedTools: validateRules(memberSettings?.allowedTools, `Permissions for ${memberName}`),
-        // Left out means "not touched": keep inheriting (or keep the earlier override).
-        chrome: typeof memberSettings?.chrome === "boolean" ? memberSettings.chrome : runtime.projectChrome,
-      });
+    managerConfig = validateAgentConfig(message.manager, teamConfig.manager, "Manager");
+    workerConfig = validateAgentConfig(message.worker, teamConfig.worker, "Worker");
+    if (team) {
+      instructions = String(message.instructions ?? "").trim();
+      if (instructions.length > MAX_INSTRUCTION_CHARACTERS) throw new Error("Project rules must be under 20,000 characters.");
+      allowedTools = validateRules(message.allowedTools, "Project permissions");
     }
+    saveApiSettings(message);
   } catch (error) {
-    socket.send(JSON.stringify({ type: "projectSettingsError", message: (error as Error).message }));
+    socket.send(JSON.stringify({ type: "settingsError", message: (error as Error).message }));
     return;
   }
 
-  const signaturesBefore = new Map([...team.runtimes.values()].map((runtime) => [runtime, launchSignature(runtime)]));
-  team.instructions = instructions;
-  team.allowedTools = allowedTools;
-  team.chrome = message.chrome === true;
-  team.sharePermissions = message.sharePermissions !== false;
-  queries.saveProjectSettings.run(team.workspace, instructions, JSON.stringify(allowedTools), team.chrome ? 1 : 0,
-    team.sharePermissions ? 1 : 0);
-  for (const [runtime, change] of memberChanges) {
-    runtime.workspaceAllowedTools = change.allowedTools;
-    runtime.projectChrome = change.chrome;
-    queries.savePermissions.run(runtime.config.name, team.workspace, JSON.stringify(change.allowedTools),
-      change.chrome === null ? null : change.chrome ? 1 : 0);
+  const runtimes = allRuntimes();
+  const signaturesBefore = new Map(runtimes.map((runtime) => [runtime, launchSignature(runtime)]));
+  teamConfig.manager = managerConfig;
+  teamConfig.worker = workerConfig;
+  saveTeamConfig();
+  for (const runtime of runtimes) runtime.config = memberConfigFor(runtime.config.name);
+  if (team) {
+    team.instructions = instructions;
+    team.allowedTools = allowedTools;
+    queries.saveProjectSettings.run(team.workspace, instructions, JSON.stringify(allowedTools));
+    broadcast({ type: "projectSettings", workspace: team.workspace, ...projectSettingsFor(team) });
   }
 
-  // Only members whose launch settings actually changed are restarted, but every
-  // member is re-sent so the browser sees saved overrides that changed nothing yet.
-  for (const runtime of team.runtimes.values()) {
-    if (launchSignature(runtime) !== signaturesBefore.get(runtime)) {
-      requestRestart(runtime);
-      if (runtime.process) recordEvent(runtime, "system", "Project settings changed; restarting to apply them.");
-    }
+  for (const runtime of runtimes) {
+    if (launchSignature(runtime) === signaturesBefore.get(runtime)) continue;
+    requestRestart(runtime);
+    if (runtime.process) recordEvent(runtime, "system", "Settings changed; restarting to apply them.");
     broadcastMember(runtime);
   }
+  broadcast({ type: "teamSettings", ...teamSettings() });
+  socket.send(JSON.stringify({ type: "settingsSaved" }));
+}
 
-  broadcast({ type: "projectSettings", workspace: team.workspace, ...projectSettingsFor(team) });
-  socket.send(JSON.stringify({ type: "projectSettingsSaved" }));
+function teamSettings() {
+  return { manager: teamConfig.manager, worker: teamConfig.worker };
 }
 
 function projectSettingsFor(team: Team) {
-  return { instructions: team.instructions, allowedTools: team.allowedTools, chrome: team.chrome, sharePermissions: team.sharePermissions };
+  return { instructions: team.instructions, allowedTools: team.allowedTools };
 }
 
-// Everything from Project settings that a member process reads at launch.
+// Everything from Settings that a member process reads at launch.
 function launchSignature(runtime: MemberRuntime): string {
-  return JSON.stringify([usesChrome(runtime), runtime.team.instructions, runtime.team.allowedTools, runtime.workspaceAllowedTools]);
+  return JSON.stringify([runtime.config, runtime.team.instructions, runtime.team.allowedTools]);
 }
 
 function handleClientMessage(socket: ServerWebSocket<unknown>, raw: string | Buffer) {
@@ -1690,19 +2760,40 @@ function handleClientMessage(socket: ServerWebSocket<unknown>, raw: string | Buf
   }
   if (message.type === "workspace") return switchWorkspace(socket, String(message.path ?? ""));
   if (message.type === "closeWorkspace") return closeWorkspace(String(message.path ?? ""));
-  if (message.type === "saveMember" || message.type === "removeMember") return changeMembers(socket, message);
-  if (message.type === "reorderMembers") return reorderMembersFrom(socket, message.order);
+  if (message.type === "addWorker" || message.type === "removeWorker") return changeMembers(socket, message);
+  if (message.type === "reorderMembers") return reorderWorkersFrom(socket, message.order);
 
   // Messages carry the workspace the browser was showing, so a send that races
   // a switch still reaches the right team. Only already-opened workspaces match.
   const workspace = message.workspace ?? projectDirectory;
   const team = workspace === projectDirectory && projectDirectory ? teamFor(projectDirectory) : teams.get(workspace);
+  if (message.type === "saveSettings") return saveSettings(socket, team, message);
   if (!team) {
-    socket.send(JSON.stringify({ type: "sendError", message: "Pick a workspace first (bottom of the sidebar)." }));
+    socket.send(JSON.stringify({ type: "sendError", message: "Pick a workspace first (top of the sidebar)." }));
     return;
   }
-  if (message.type === "saveProjectSettings") return saveProjectSettings(socket, team, message);
   if (message.type === "allowAllPermissions") return allowAllPermissions(team);
+  if (message.type === "archiveDoneItems") {
+    queries.archiveDoneItems.run(team.workspace);
+    return broadcastItems(team);
+  }
+  if (message.type === "archiveAllItems") {
+    queries.archiveAllItems.run(team.workspace);
+    return broadcastItems(team);
+  }
+  if (message.type === "cancelSchedule") {
+    try {
+      const schedule = cancelSchedule(team, message.scheduleId);
+      recordEvent(team.manager, "system", `You cancelled scheduled work #${schedule.id} "${schedule.title}".`);
+    } catch (error) {
+      socket.send(JSON.stringify({ type: "sendError", message: (error as Error).message }));
+    }
+    return;
+  }
+  if (message.type === "archiveItem") {
+    queries.archiveItem.run(Number(message.itemId), team.workspace);
+    return broadcastItems(team);
+  }
 
   const runtime = team.runtimes.get(message.member);
   if (!runtime) return;
@@ -1727,6 +2818,15 @@ function handleClientMessage(socket: ServerWebSocket<unknown>, raw: string | Buf
       const typedText = String(message.text ?? "").trim();
       if (!typedText && attachments.length === 0) break;
       const text = typedText || "See the attached file(s).";
+      if (message.itemId !== undefined && message.itemId !== null) {
+        const item = isManager(runtime) ? queries.findItem.get(Number(message.itemId), team.workspace) : null;
+        if (!item) {
+          socket.send(JSON.stringify({ type: "sendError", message: "That task summary item no longer exists." }));
+          break;
+        }
+        sendTurn(runtime, text, { kind: "user", itemId: item.id }, "user", attachments, itemQuote(item));
+        break;
+      }
       if (message.threadId === undefined || message.threadId === null) {
         sendTurn(runtime, text, { kind: text.startsWith("/") ? "command" : "user" }, "user", attachments);
         break;
@@ -1736,9 +2836,18 @@ function handleClientMessage(socket: ServerWebSocket<unknown>, raw: string | Buf
         socket.send(JSON.stringify({ type: "sendError", message: "That thread no longer exists." }));
         break;
       }
-      sendTurn(runtime, text, { kind: "user" }, "user", attachments, threadRoot);
+      sendTurn(runtime, text, { kind: "user", threadId: threadRoot.id }, "user", attachments, threadQuote(threadRoot.text));
       break;
     }
+    case "itemEvents":
+      socket.send(JSON.stringify({
+        type: "itemEvents",
+        workspace: team.workspace,
+        member: runtime.config.name,
+        itemId: Number(message.itemId),
+        events: queries.itemEvents.all(team.workspace, Number(message.itemId), HISTORY_LIMIT),
+      }));
+      break;
     case "compact": {
       const instruction = String(message.instruction ?? "").trim();
       sendTurn(runtime, `/compact${instruction ? ` ${instruction}` : ""}`, { kind: "command" });
@@ -1773,6 +2882,19 @@ const staticFiles: Record<string, string> = {
   "/style.css": "style.css",
 };
 
+// Open tabs reconnect on their own after a restart and would keep running the old page;
+// the snapshot carries this version, and a tab that loaded another one reloads itself.
+function clientVersion(): string {
+  const contents = Object.values(staticFiles).map((fileName) => {
+    try {
+      return readFileSync(join(rootDirectory, "public", fileName), "utf8");
+    } catch {
+      return "";
+    }
+  });
+  return Bun.hash(contents.join("\n")).toString(36);
+}
+
 const server = Bun.serve({
   hostname: "127.0.0.1",
   port,
@@ -1791,7 +2913,9 @@ const server = Bun.serve({
       return handleMcpRequest(caller, request);
     }
     const fileName = staticFiles[url.pathname];
-    if (fileName) return new Response(Bun.file(join(rootDirectory, "public", fileName)));
+    if (fileName) {
+      return new Response(Bun.file(join(rootDirectory, "public", fileName)), { headers: { "Cache-Control": "no-cache" } });
+    }
     return new Response("Not found", { status: 404 });
   },
   websocket: {
@@ -1807,6 +2931,13 @@ const server = Bun.serve({
   },
 });
 broadcast = (message) => server.publish("team", JSON.stringify(message));
+
+setInterval(() => {
+  for (const team of teams.values()) watchTeam(team);
+}, WATCHDOG_INTERVAL_MS);
+
+setInterval(runDueSchedules, SCHEDULE_SWEEP_INTERVAL_MS);
+runDueSchedules();
 
 // Idle members are put to sleep to free memory; the next message resumes their session.
 setInterval(() => {

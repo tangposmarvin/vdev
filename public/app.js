@@ -6,19 +6,30 @@ const state = {
   selected: null,
   histories: new Map(),
   streaming: new Map(),
-  // member -> root event id of the thread the streaming text belongs to (null = main chat)
-  streamingThread: new Map(),
-  // { member, rootId } of the thread shown in the side panel
+  // member -> { threadId, itemId, origin } of the turn the streaming text belongs to
+  streamingPlacement: new Map(),
+  // { member, rootId, itemId } of the thread shown in the side panel: a reply thread
+  // under a message (rootId) or a task summary item (itemId)
   openThread: null,
   unreadThreads: new Set(),
+  // the Manager's task summary for this workspace, oldest first
+  items: [],
+  // work the Manager scheduled for later, soonest first
+  schedules: [],
+  // item id -> events filed under it, loaded the first time its thread opens
+  itemEvents: new Map(),
+  unreadItems: new Set(),
+  // show everything in the Manager's chat, not only your conversation with it
+  showActivity: false,
   unread: new Set(),
   unreadWorkspaces: new Set(),
-  memberConfigs: [],
-  editingMember: null,
   pendingSelection: null,
+  // project allow rules the open Settings form has shown (see appendNewProjectRules)
+  settingsShownRules: new Set(),
   // name of the worker being dragged in the sidebar; list re-renders wait until the drop
   draggingMember: null,
-  attachments: [],
+  // composer whose send the server's next sendError answers
+  lastComposer: null,
   socket: null,
 };
 
@@ -27,10 +38,19 @@ const IMAGE_MEDIA_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
 const MAX_BYTES_BY_KIND = { image: 5 * 1024 * 1024, pdf: 10 * 1024 * 1024, text: 1024 * 1024 };
 const MAX_TOTAL_BYTES = 24 * 1024 * 1024;
 
+// Every message box (main chat, thread panel) is built from one template and one
+// factory, so attaching, pasting and dropping files work the same everywhere.
+const mainComposer = createComposer(document.querySelector(".js-composer"));
+const threadComposer = createComposer(document.querySelector(".js-thread-composer"));
+
 const elements = {
   connection: document.querySelector(".js-connection"),
   memberList: document.querySelector(".js-member-list"),
   rateLimit: document.querySelector(".js-rate-limit"),
+  apiFields: document.querySelector(".js-api-fields"),
+  clearApiKeyField: document.querySelector(".js-clear-api-key-field"),
+  apiFallbackStatus: document.querySelector(".js-api-fallback-status"),
+  apiModeHint: document.querySelector(".js-api-mode-hint"),
   workspaceToggle: document.querySelector(".js-workspace-toggle"),
   workspaceName: document.querySelector(".js-workspace-name"),
   activeWorkspaces: document.querySelector(".js-active-workspaces"),
@@ -47,47 +67,54 @@ const elements = {
   taskBanner: document.querySelector(".js-task-banner"),
   permissionRequests: document.querySelector(".js-permission-requests"),
   messages: document.querySelector(".js-messages"),
+  taskSummary: document.querySelector(".js-task-summary"),
+  taskSummaryCounts: document.querySelector(".js-task-summary-counts"),
+  taskSummaryList: document.querySelector(".js-task-summary-list"),
+  scheduleSection: document.querySelector(".js-schedule-section"),
+  scheduleList: document.querySelector(".js-schedule-list"),
+  archiveDoneButton: document.querySelector(".js-archive-done"),
+  archiveAllButton: document.querySelector(".js-archive-all"),
+  toggleActivityButton: document.querySelector(".js-toggle-activity"),
   layout: document.querySelector(".layout"),
   threadPanel: document.querySelector(".js-thread-panel"),
+  threadTitle: document.querySelector(".js-thread-title"),
   threadMeta: document.querySelector(".js-thread-meta"),
   threadMessages: document.querySelector(".js-thread-messages"),
-  threadComposer: document.querySelector(".js-thread-composer"),
-  threadInput: document.querySelector(".js-thread-input"),
+  threadComposer: threadComposer.form,
+  threadInput: threadComposer.input,
   closeThreadButton: document.querySelector(".js-close-thread"),
-  composer: document.querySelector(".js-composer"),
-  input: document.querySelector(".js-input"),
-  attachButton: document.querySelector(".js-attach"),
-  fileInput: document.querySelector(".js-file-input"),
-  attachmentList: document.querySelector(".js-attachment-list"),
-  composerError: document.querySelector(".js-composer-error"),
+  threadResizeHandle: document.querySelector(".js-thread-resize"),
+  composer: mainComposer.form,
+  input: mainComposer.input,
   compactButton: document.querySelector(".js-compact"),
   resetButton: document.querySelector(".js-reset"),
   stopButton: document.querySelector(".js-stop"),
-  editMemberButton: document.querySelector(".js-edit-member"),
-  permissionsButton: document.querySelector(".js-permissions"),
+  removeWorkerButton: document.querySelector(".js-remove-worker"),
   chat: document.querySelector(".chat"),
   openSettingsButton: document.querySelector(".js-open-settings"),
   settingsPage: document.querySelector(".js-settings-page"),
   settingsPath: document.querySelector(".js-settings-path"),
   settingsForm: document.querySelector(".js-settings-form"),
-  settingsMembers: document.querySelector(".js-settings-members"),
+  projectFields: document.querySelector(".js-project-fields"),
+  settingsProjectName: document.querySelector(".js-settings-project-name"),
   settingsError: document.querySelector(".js-settings-error"),
   settingsStatus: document.querySelector(".js-settings-status"),
   closeSettingsButton: document.querySelector(".js-close-settings"),
-  addMemberButton: document.querySelector(".js-add-member"),
+  addWorkerButton: document.querySelector(".js-add-worker"),
   allowAllPermissionsButton: document.querySelector(".js-allow-all-permissions"),
-  memberDialog: document.querySelector(".js-member-dialog"),
-  memberForm: document.querySelector(".js-member-form"),
-  memberFormTitle: document.querySelector(".js-member-form-title"),
-  memberFormError: document.querySelector(".js-member-form-error"),
-  removeMemberButton: document.querySelector(".js-remove-member"),
-  cancelMemberButton: document.querySelector(".js-cancel-member"),
 };
 
 const AVATAR_COLOR_COUNT = 8;
 const MESSAGE_GROUP_MS = 5 * 60 * 1000;
 const BOT_NAME = "vdev";
-const CARD_TITLES = { task: "Task", handoff: "Handoff", error: "Error" };
+const CARD_TITLES = { task: "Task", handoff: "Handoff", error: "Error", item: "Update" };
+const ITEM_STATUS_LABELS = { working: "working", needs_input: "needs input", done: "done", failed: "failed", stopped: "stopped" };
+const ITEM_REPORT_FIELDS = [
+  ["problem", "Problem"], ["fix", "Fix"], ["commit", "Commit"], ["specs", "Specs"],
+  ["ui_verification", "UI verification"], ["notes", "Notes"],
+];
+// Events in an item's thread that flag the item as having something new for you.
+const ITEM_ALERT_KINDS = new Set(["assistant", "item", "error"]);
 const PAGE_TITLE = document.title;
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 
@@ -132,14 +159,21 @@ function handleServerMessage(message) {
   }
   switch (message.type) {
     case "snapshot":
+      if (isOutdatedClient(message.clientVersion)) {
+        location.reload();
+        return;
+      }
       state.order = message.members.map((member) => member.name);
       state.members = new Map(message.members.map((member) => [member.name, member]));
-      state.memberConfigs = message.memberConfigs ?? [];
       state.histories.clear();
       state.streaming.clear();
-      state.streamingThread.clear();
+      state.streamingPlacement.clear();
       state.unread.clear();
       state.unreadThreads.clear();
+      state.items = message.items ?? [];
+      state.schedules = message.schedules ?? [];
+      state.itemEvents.clear();
+      state.unreadItems.clear();
       closeThread();
       state.workspace = message;
       state.unreadWorkspaces.delete(message.workspace);
@@ -147,6 +181,7 @@ function handleServerMessage(message) {
       renderActiveWorkspaces();
       if (message.workspace) toggleWorkspacePanel(false);
       else toggleWorkspacePanel(true);
+      state.rateLimit = message.rateLimit;
       renderRateLimit(message.rateLimit);
       selectMember(
         [state.pendingSelection, state.selected, rememberedMember()].find((name) => state.members.has(name)) ??
@@ -160,7 +195,7 @@ function handleServerMessage(message) {
       applyMemberOrder(message.order);
       break;
     case "memberOrderError":
-      showComposerError(message.message);
+      mainComposer.showError(message.message);
       break;
     case "member":
       state.members.set(message.member.name, message.member);
@@ -176,47 +211,66 @@ function handleServerMessage(message) {
       handleEvent(message.member, message.event);
       break;
     case "delta":
-      handleDelta(message.member, message.text, message.threadId ?? null);
+      handleDelta(message.member, message.text, message.placement ?? {});
+      break;
+    case "items":
+      applyItems(message.items);
+      break;
+    case "schedules":
+      state.schedules = message.schedules ?? [];
+      renderTaskSummary();
+      break;
+    case "itemEvents":
+      state.itemEvents.set(message.itemId, message.events);
+      if (state.openThread?.itemId === message.itemId) renderThread();
       break;
     case "rate":
+      state.rateLimit = message.rateLimit;
       renderRateLimit(message.rateLimit);
+      break;
+    case "apiSettings":
+      if (state.workspace) state.workspace.apiSettings = message;
+      renderRateLimit(state.rateLimit);
+      if (!elements.settingsPage.hidden) renderApiFallbackStatus();
       break;
     case "workspaces":
       if (state.workspace) state.workspace.activeWorkspaces = message.activeWorkspaces;
       renderActiveWorkspaces();
       break;
     case "sendError":
-      showComposerError(message.message);
+      (state.lastComposer ?? mainComposer).showError(message.message);
       break;
     case "projectSettings":
-      if (state.workspace) {
-        state.workspace.projectSettings = {
-          instructions: message.instructions, allowedTools: message.allowedTools, chrome: message.chrome, sharePermissions: message.sharePermissions,
-        };
-      }
+      if (state.workspace) state.workspace.projectSettings = { instructions: message.instructions, allowedTools: message.allowedTools };
+      if (!elements.settingsPage.hidden) appendNewProjectRules(message.allowedTools);
       break;
-    case "projectSettingsSaved":
-      for (const checkbox of elements.settingsMembers.querySelectorAll(".js-settings-member-chrome")) {
-        checkbox.dataset.initial = String(memberChromeValue(checkbox));
-      }
+    case "teamSettings":
+      if (state.workspace) state.workspace.teamSettings = { manager: message.manager, worker: message.worker };
+      break;
+    case "settingsSaved":
       elements.settingsStatus.textContent = "Saved. Affected members restart to apply it (busy ones after their current work).";
       break;
-    case "projectSettingsError":
+    case "settingsError":
+      elements.settingsStatus.textContent = "";
       elements.settingsError.textContent = message.message;
       elements.settingsError.hidden = false;
       break;
-    case "memberSaved":
-      elements.memberDialog.close();
-      break;
-    case "memberError":
-      elements.memberFormError.textContent = message.message;
-      elements.memberFormError.hidden = false;
+    case "workerAdded":
+      state.pendingSelection = message.name;
       break;
     case "workspaceError":
       elements.workspaceError.textContent = message.message;
       elements.workspaceError.hidden = false;
       break;
   }
+}
+
+// The first snapshot tells which page version this tab runs. After a server restart with
+// changed client files, the reconnect brings a new version and the tab reloads to pick them up.
+function isOutdatedClient(version) {
+  if (!version) return false;
+  state.clientVersion ??= version;
+  return version !== state.clientVersion;
 }
 
 // Members in background workspaces keep working; only flag that something happened there.
@@ -234,7 +288,6 @@ function renderWorkspace() {
   elements.workspaceName.textContent = workspace.workspaceName ?? "none selected";
   elements.workspaceToggle.title = workspace.workspace ?? "Pick a folder for the team to work in";
   elements.input.disabled = !workspace.workspace;
-  elements.openSettingsButton.disabled = !workspace.workspace;
   renderWorkspaceGroup(elements.workspaceRecent, "Recent", workspace.recentWorkspaces);
   renderWorkspaceGroup(elements.workspaceCandidates, "Repositories", workspace.candidateWorkspaces);
 }
@@ -332,24 +385,62 @@ function openWorkspace(path) {
 
 function handleEvent(memberName, event) {
   if (event.kind === "assistant") state.streaming.delete(memberName);
-  const history = state.histories.get(memberName);
-  if (history) history.push(event);
+  state.histories.get(memberName)?.push(event);
+  const itemId = event.item_id ?? null;
+  if (itemId !== null) noteItemEvent(itemId, event);
   if (memberName !== state.selected) {
-    if (event.kind === "tool") return;
+    if (!isNoteworthy(memberName, event)) return;
     state.unread.add(memberName);
     renderMemberList();
     return;
   }
 
   const threadId = event.thread_id ?? null;
-  if (threadId === null) {
-    appendLiveEvent(views.main, event);
-  } else {
-    if (state.openThread?.rootId === threadId) appendLiveEvent(views.thread, event);
-    else if (event.kind !== "tool") state.unreadThreads.add(threadId);
-    renderThreadSummary(threadId);
-  }
+  if (isInOpenThread(memberName, event)) appendLiveEvent(views.thread, event);
+  else if (threadId !== null && event.kind !== "tool") state.unreadThreads.add(threadId);
+  if (threadId !== null) renderThreadSummary(threadId);
+  if (showsInMain(memberName, event)) appendLiveEvent(views.main, event);
   renderStreamingBubbles();
+}
+
+function noteItemEvent(itemId, event) {
+  state.itemEvents.get(itemId)?.push(event);
+  if (state.openThread?.itemId === itemId || !ITEM_ALERT_KINDS.has(event.kind)) return;
+  state.unreadItems.add(itemId);
+  renderTaskSummary();
+}
+
+function isManagerName(memberName) {
+  return Boolean(state.members.get(memberName)?.isManager);
+}
+
+function managerName() {
+  return state.order.find(isManagerName) ?? null;
+}
+
+// The Manager's main chat is your conversation with it. What workers report, and what it
+// writes while handling that, lives in the task summary item threads (or under "Show activity").
+function showsInMain(memberName, event, showActivity = state.showActivity) {
+  if ((event.thread_id ?? null) !== null) return false;
+  if (!isManagerName(memberName) || showActivity) return true;
+  if ((event.item_id ?? null) !== null) return false;
+  if (event.kind === "user" || event.kind === "error") return true;
+  if (event.kind !== "assistant") return false;
+  return !event.origin || event.origin === "user" || event.origin === "command";
+}
+
+// Worth a "new" badge on a member you are not looking at.
+function isNoteworthy(memberName, event) {
+  if (event.kind === "tool") return false;
+  if (!isManagerName(memberName)) return true;
+  return event.kind === "item" || showsInMain(memberName, event, false);
+}
+
+function isInOpenThread(memberName, event) {
+  const thread = state.openThread;
+  if (!thread || thread.member !== memberName) return false;
+  if (thread.itemId !== null) return event.item_id === thread.itemId && event.kind !== "tool";
+  return (event.thread_id ?? null) === thread.rootId;
 }
 
 function appendLiveEvent(view, event) {
@@ -358,202 +449,126 @@ function appendLiveEvent(view, event) {
   scrollToBottom(view);
 }
 
-function handleDelta(memberName, text, threadId) {
-  if (state.streamingThread.get(memberName) !== threadId) state.streaming.delete(memberName);
-  state.streamingThread.set(memberName, threadId);
+function handleDelta(memberName, text, placement) {
+  const previous = state.streamingPlacement.get(memberName);
+  const samePlacement = previous && ["threadId", "itemId", "origin"].every((key) => (previous[key] ?? null) === (placement[key] ?? null));
+  if (!samePlacement) state.streaming.delete(memberName);
+  state.streamingPlacement.set(memberName, placement);
   state.streaming.set(memberName, (state.streaming.get(memberName) ?? "") + text);
   if (memberName !== state.selected) return;
   renderStreamingBubbles();
 }
 
-// ---------------------------------------------------------------- member editor
+// ---------------------------------------------------------------- settings
 
-function openMemberEditor(memberName) {
-  const memberConfig = state.memberConfigs.find((config) => config.name === memberName);
-  const fields = elements.memberForm.elements;
-  state.editingMember = memberConfig?.name ?? null;
-  elements.memberForm.reset();
-  elements.memberFormTitle.textContent = memberConfig ? `Edit ${memberConfig.name}` : "Add member";
-  elements.memberFormError.hidden = true;
-  resetRemoveButton();
-  renderTemplateOptions(memberConfig);
+const MODEL_GROUPS = [
+  ["Latest (updates automatically)", [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"], ["haiku", "Haiku (latest)"]]],
+  ["Pinned version", [["claude-fable-5-1", "Fable 5.1"], ["claude-opus-5-5", "Opus 5.5"], ["claude-sonnet-5-5", "Sonnet 5.5"], ["claude-haiku-4-5-20251001", "Haiku 4.5"]]],
+];
+const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 
-  const isManager = memberConfig?.role === "manager";
-  fields.name.value = memberConfig?.name ?? "";
-  fields.name.disabled = Boolean(memberConfig);
-  fields.role.disabled = isManager;
-  fillMemberFields(memberConfig);
-  elements.removeMemberButton.hidden = !memberConfig || isManager;
-
-  elements.memberDialog.showModal();
-  (memberConfig ? fields.role.disabled ? fields.model : fields.role : fields.name).focus();
+function agentFieldset(agent) {
+  return elements.settingsForm.querySelector(`.js-agent-fields[data-agent="${agent}"]`);
 }
 
-// Everything but the name, so a template fills a new member the same way.
-function fillMemberFields(memberConfig) {
-  const fields = elements.memberForm.elements;
-  fields.role.value = memberConfig?.role ?? "";
-  setModelField(memberConfig?.model ?? "sonnet");
-  fields.effort.value = memberConfig?.effort ?? "";
-  fields.permissionMode.value = memberConfig?.permissionMode ?? "";
-  fields.budget.value = memberConfig?.budget ?? "";
-  fields.prompt.value = memberConfig?.prompt ?? "";
-  // New members start read-only; existing ones show exactly what team.json has.
-  const allowedTools = memberConfig ? memberConfig.allowedTools ?? [] : ["Read", "Glob", "Grep"];
-  fields.allowedTools.value = allowedTools.join("\n");
-  fields.tools.value = (memberConfig?.tools ?? []).join("\n");
-  fields.autocompact.value = memberConfig?.autocompact ?? "";
-  fields.chrome.checked = Boolean(memberConfig?.chrome);
+function optionElement(value, label) {
+  const node = element("option", "", label);
+  node.value = value;
+  return node;
 }
 
-function renderTemplateOptions(editingConfig) {
-  const templateField = elements.memberForm.querySelector(".js-template-field");
-  const select = elements.memberForm.querySelector(".js-template-select");
-  templateField.hidden = Boolean(editingConfig);
-  const options = state.memberConfigs
-    .filter((memberConfig) => memberConfig.role !== "manager")
-    .map((memberConfig) => {
-      const option = element("option", "", `${memberConfig.name} - ${memberConfig.role}`);
-      option.value = memberConfig.name;
-      return option;
+// "Your default" sends no --model / --effort, so the member uses the same as `claude` in a terminal.
+function renderAgentSelects() {
+  for (const select of elements.settingsForm.querySelectorAll(".js-model-select")) {
+    const groups = MODEL_GROUPS.map(([label, models]) => {
+      const group = element("optgroup");
+      group.label = label;
+      group.append(...models.map(([value, modelLabel]) => optionElement(value, modelLabel)));
+      return group;
     });
-  const emptyOption = element("option", "", "Start empty");
-  emptyOption.value = "";
-  select.replaceChildren(emptyOption, ...options);
+    select.replaceChildren(optionElement("", "Your default"), ...groups, optionElement("custom", "Other model ID..."));
+  }
+  for (const select of elements.settingsForm.querySelectorAll(".js-effort-select")) {
+    select.replaceChildren(optionElement("", "Your default"), ...EFFORT_LEVELS.map((level) => optionElement(level, level)));
+  }
 }
 
-function applyTemplate(templateName) {
-  const fields = elements.memberForm.elements;
-  const template = state.memberConfigs.find((memberConfig) => memberConfig.name === templateName);
-  fillMemberFields(template ?? null);
-  if (!template) return;
-  fields.name.value = nextFreeName(template.name);
-  fields.name.focus();
-  fields.name.select();
+// Fills only the fields the fieldset has; the manager shows fewer than workers.
+function fillAgentFields(fieldset, agentConfig) {
+  const fields = fieldset.elements;
+  setModelField(fieldset, agentConfig.model ?? "");
+  fields.effort.value = agentConfig.effort ?? "";
+  fields.prompt.value = agentConfig.prompt ?? "";
+  if (fields.permissionMode) fields.permissionMode.value = agentConfig.permissionMode ?? "";
+  if (fields.budget) fields.budget.value = agentConfig.budget ?? "";
+  if (fields.allowedTools) fields.allowedTools.value = (agentConfig.allowedTools ?? []).join("\n");
+  if (fields.chrome) fields.chrome.checked = Boolean(agentConfig.chrome);
 }
 
-// qa -> qa2, qa2 -> qa3: the first numbered name not taken yet.
-function nextFreeName(templateName) {
-  const baseName = templateName.replace(/\d+$/, "");
-  const takenNames = new Set(state.memberConfigs.map((memberConfig) => memberConfig.name));
-  let number = 2;
-  while (takenNames.has(`${baseName}${number}`)) number += 1;
-  return `${baseName}${number}`;
+function agentFieldValues(fieldset) {
+  const fields = fieldset.elements;
+  const values = {
+    model: fields.model.value === "custom" ? fields.customModel.value.trim() : fields.model.value,
+    effort: fields.effort.value,
+    prompt: fields.prompt.value,
+  };
+  if (fields.permissionMode) values.permissionMode = fields.permissionMode.value;
+  if (fields.budget) values.budget = fields.budget.value;
+  if (fields.allowedTools) values.allowedTools = ruleLines(fields.allowedTools.value);
+  if (fields.chrome) values.chrome = fields.chrome.checked;
+  return values;
 }
 
 // Known models show in the list; anything else (an older ID, say) shows as
 // "Other model ID" with the value in the text box, so it is kept as is.
-function setModelField(model) {
-  const fields = elements.memberForm.elements;
-  const known = [...fields.model.options].some((option) => option.value === model && option.value !== "custom");
+function setModelField(fieldset, model) {
+  const fields = fieldset.elements;
+  const known = [...fields.model.options].some((modelOption) => modelOption.value === model && modelOption.value !== "custom");
   fields.model.value = known ? model : "custom";
   fields.customModel.value = known ? "" : model;
-  syncCustomModelField();
+  syncCustomModelField(fieldset);
 }
 
-function syncCustomModelField() {
-  const fields = elements.memberForm.elements;
+function syncCustomModelField(fieldset) {
+  const fields = fieldset.elements;
   const custom = fields.model.value === "custom";
   fields.customModel.hidden = !custom;
   fields.customModel.required = custom;
 }
 
-function memberFormValues() {
-  const fields = elements.memberForm.elements;
-  const lines = (text) => text.split("\n").map((line) => line.trim()).filter(Boolean);
-  return {
-    originalName: state.editingMember,
-    name: fields.name.value.trim(),
-    role: fields.role.value.trim(),
-    model: fields.model.value === "custom" ? fields.customModel.value.trim() : fields.model.value,
-    effort: fields.effort.value,
-    permissionMode: fields.permissionMode.value,
-    budget: fields.budget.value,
-    prompt: fields.prompt.value,
-    allowedTools: lines(fields.allowedTools.value),
-    tools: lines(fields.tools.value),
-    autocompact: fields.autocompact.value.trim(),
-    chrome: fields.chrome.checked,
-  };
-}
+// Rendered once per opening so live updates never wipe unsaved edits.
+function openSettings() {
+  const teamSettings = state.workspace?.teamSettings;
+  if (!teamSettings) return;
+  fillAgentFields(agentFieldset("worker"), teamSettings.worker);
+  fillAgentFields(agentFieldset("manager"), teamSettings.manager);
 
-// ---------------------------------------------------------------- project settings
+  const projectSettings = state.workspace.projectSettings;
+  const projectFields = elements.projectFields.elements;
+  elements.projectFields.hidden = !projectSettings;
+  elements.settingsProjectName.textContent = state.workspace.workspaceName ?? "";
+  projectFields.instructions.value = projectSettings?.instructions ?? "";
+  projectFields.allowedTools.value = (projectSettings?.allowedTools ?? []).join("\n");
+  // Rules the form has already shown, so a rule the user deletes is not added back.
+  state.settingsShownRules = new Set(projectSettings?.allowedTools ?? []);
 
-// Rendered once per opening so live member updates never wipe unsaved edits.
-function openSettings(focusMemberName) {
-  const projectSettings = state.workspace?.projectSettings;
-  if (!projectSettings) return;
-  const fields = elements.settingsForm.elements;
-  fields.instructions.value = projectSettings.instructions;
-  fields.allowedTools.value = projectSettings.allowedTools.join("\n");
-  fields.chrome.checked = projectSettings.chrome;
-  fields.sharePermissions.checked = projectSettings.sharePermissions !== false;
-  elements.settingsPath.textContent = state.workspace.workspace;
+  const apiSettings = state.workspace.apiSettings ?? {};
+  const apiFields = elements.apiFields.elements;
+  apiFields.apiKey.value = "";
+  apiFields.apiKey.placeholder = apiSettings.apiKeyHint ? `Saved key ${apiSettings.apiKeyHint} (type to replace)` : "sk-ant-...";
+  apiFields.clearApiKey.checked = false;
+  elements.clearApiKeyField.hidden = !apiSettings.apiKeyHint;
+  apiFields.apiMode.value = apiSettings.apiMode ?? "off";
+  renderApiModeHint();
+  renderApiFallbackStatus();
+
+  elements.settingsPath.textContent = state.workspace.workspace ?? "";
   elements.settingsError.hidden = true;
   elements.settingsStatus.textContent = "";
-  elements.settingsMembers.replaceChildren(...state.order.map((memberName) => settingsMemberRow(state.members.get(memberName))));
-  syncMemberChromeSwitches();
-
   closeThread();
   elements.chat.hidden = true;
   elements.settingsPage.hidden = false;
-  const focusField = focusMemberName && elements.settingsMembers.querySelector(`[data-member="${CSS.escape(focusMemberName)}"]`);
-  if (focusField) {
-    focusField.scrollIntoView({ block: "center" });
-    focusField.focus();
-  } else {
-    fields.instructions.focus();
-  }
-}
-
-function settingsMemberRow(member) {
-  const row = element("div", "settings-member");
-  const heading = element("div", "settings-member-heading");
-  heading.append(element("span", "member-name", member.name), element("span", "member-role", member.role));
-
-  const chromeChecked = member.projectChrome ?? member.chromeDefault;
-  const chromeSwitch = element("label", "settings-member-chrome");
-  const chromeCheckbox = element("input", "js-settings-member-chrome");
-  chromeCheckbox.type = "checkbox";
-  chromeCheckbox.dataset.member = member.name;
-  chromeCheckbox.dataset.initial = String(chromeChecked);
-  chromeCheckbox.dataset.own = String(chromeChecked);
-  chromeCheckbox.checked = chromeChecked;
-  chromeSwitch.title = member.projectChrome === null ? "Using this member's default (Edit member)" : "Set for this project";
-  chromeSwitch.append(chromeCheckbox, element("span", "", "Claude in Chrome"));
-  heading.append(chromeSwitch);
-
-  const textarea = element("textarea", "form-input form-textarea form-mono js-settings-member-rules");
-  textarea.rows = 3;
-  textarea.spellcheck = false;
-  textarea.dataset.member = member.name;
-  textarea.placeholder = "Extra rules for this member, one per line";
-  textarea.setAttribute("aria-label", `Extra permissions for ${member.name}`);
-  textarea.value = (member.workspaceAllowedTools ?? []).join("\n");
-
-  const baseRules = [...member.allowedTools, ...(member.chrome ? ["mcp__claude-in-chrome"] : [])];
-  const base = element("pre", "permissions-base", baseRules.length > 0 ? baseRules.join("\n") : "(no rules of its own)");
-  base.title = "Always allowed for this member (Edit member)";
-
-  const columns = element("div", "settings-member-columns");
-  columns.append(textarea, base);
-  row.append(heading, columns);
-  return row;
-}
-
-// "All members" wins: member switches show as on and locked, and get their
-// own value back when it is turned off again.
-function syncMemberChromeSwitches() {
-  const allMembers = elements.settingsForm.elements.chrome.checked;
-  for (const checkbox of elements.settingsMembers.querySelectorAll(".js-settings-member-chrome")) {
-    if (allMembers && !checkbox.disabled) checkbox.dataset.own = String(checkbox.checked);
-    checkbox.disabled = allMembers;
-    checkbox.checked = allMembers || checkbox.dataset.own === "true";
-  }
-}
-
-function memberChromeValue(checkbox) {
-  return checkbox.disabled ? checkbox.dataset.own === "true" : checkbox.checked;
+  agentFieldset("worker").elements.model.focus();
 }
 
 function closeSettings() {
@@ -562,14 +577,25 @@ function closeSettings() {
   elements.input.focus();
 }
 
+// "Always allow" while Settings is open: add the saved rule to the open form so
+// pressing Save keeps it, without wiping unsaved edits.
+function appendNewProjectRules(allowedTools) {
+  const rulesField = elements.projectFields.elements.allowedTools;
+  const shownRules = new Set(ruleLines(rulesField.value));
+  const newRules = (allowedTools ?? []).filter((rule) => !shownRules.has(rule) && !state.settingsShownRules.has(rule));
+  if (newRules.length === 0) return;
+  for (const rule of newRules) state.settingsShownRules.add(rule);
+  rulesField.value = [...ruleLines(rulesField.value), ...newRules].join("\n");
+}
+
 function ruleLines(text) {
   return text.split("\n").map((line) => line.trim()).filter(Boolean);
 }
 
 // Removing takes two clicks instead of a blocking confirm() dialog.
 function resetRemoveButton() {
-  delete elements.removeMemberButton.dataset.armed;
-  elements.removeMemberButton.textContent = "Remove member";
+  delete elements.removeWorkerButton.dataset.armed;
+  elements.removeWorkerButton.textContent = "Remove";
 }
 
 // ---------------------------------------------------------------- selection
@@ -597,6 +623,7 @@ function selectMember(memberName) {
   elements.input.placeholder = `Message ${member?.name ?? memberName}`;
   renderMemberList();
   renderHeader();
+  renderTaskSummary();
   if (state.histories.has(memberName)) renderMessages();
   else {
     resetView(views.main);
@@ -698,12 +725,13 @@ function renderHeader() {
   elements.memberAvatar.className = `avatar avatar-large avatar-color-${colorIndex(member.name)} js-member-avatar`;
   elements.memberAvatar.textContent = initials(member.name);
   const context = member.contextWindow ? ` - context ${formatTokens(member.contextTokens)}/${formatTokens(member.contextWindow)}` : "";
-  elements.memberMeta.textContent = `${member.role} - ${member.model} - ${statusLabel(member)}${context} - ${formatTokens(member.totalSpent)} tokens total`;
+  elements.memberMeta.textContent = `${member.role} - ${member.model}${member.billing === "api" ? " (API key)" : ""} - ${statusLabel(member)}${context} - ${formatTokens(member.totalSpent)} tokens total`;
   elements.stopButton.disabled = member.status === "asleep";
-  elements.editMemberButton.disabled = false;
-  elements.permissionsButton.disabled = false;
-  const extraRules = member.workspaceAllowedTools?.length ?? 0;
-  elements.permissionsButton.textContent = extraRules > 0 ? `Permissions (+${extraRules})` : "Permissions";
+  if (elements.removeWorkerButton.dataset.member !== member.name) resetRemoveButton();
+  elements.removeWorkerButton.dataset.member = member.name;
+  elements.removeWorkerButton.hidden = member.isManager;
+  elements.toggleActivityButton.hidden = !member.isManager;
+  renderActivityToggle();
 
   if (member.task) {
     elements.taskBanner.hidden = false;
@@ -727,9 +755,7 @@ function renderPermissionRequests(member) {
     const actions = element("div", "permission-request-actions");
     const buttons = [
       ["allow", "button button-primary", "Allow once", "Run this call only"],
-      request.browser || state.workspace?.projectSettings?.sharePermissions !== false
-        ? ["always", "button", `Always allow ${request.rule}`, `Save ${request.rule} for all members in this workspace`]
-        : ["always", "button", `Always allow ${request.rule}`, `Save ${request.rule} for ${member.name} in this workspace`],
+      ["always", "button", `Always allow ${request.rule}`, `Save ${request.rule} for all members in this workspace`],
       ["deny", "button button-danger", "Deny", "Refuse this call; the member continues without it"],
     ].map(([decision, className, label, title]) => {
       const button = element("button", `${className} js-answer-permission`, label);
@@ -750,10 +776,176 @@ function renderPermissionRequests(member) {
 function renderMessages() {
   resetView(views.main);
   for (const event of state.histories.get(state.selected) ?? []) {
-    if ((event.thread_id ?? null) === null) appendEvent(event, views.main);
+    if (showsInMain(state.selected, event)) appendEvent(event, views.main);
   }
   renderStreamingBubbles();
   scrollToBottom(views.main, true);
+}
+
+function renderActivityToggle() {
+  elements.toggleActivityButton.textContent = state.showActivity ? "Hide activity" : "Show activity";
+  elements.toggleActivityButton.setAttribute("aria-pressed", String(state.showActivity));
+}
+
+function savedShowActivity() {
+  try {
+    return localStorage.getItem("vdev.showActivity") === "true";
+  } catch {
+    return false;
+  }
+}
+
+function setShowActivity(showActivity) {
+  state.showActivity = showActivity;
+  try {
+    localStorage.setItem("vdev.showActivity", String(showActivity));
+  } catch {
+    // storage unavailable; the choice lasts until the page reloads
+  }
+  renderActivityToggle();
+  renderMessages();
+}
+
+// ---------------------------------------------------------------- task summary
+
+function itemById(itemId) {
+  return state.items.find((item) => item.id === itemId) ?? null;
+}
+
+// Re-renders the open item's thread only when that item changed, so its scroll position survives other updates.
+function applyItems(items) {
+  const openItemId = state.openThread?.itemId ?? null;
+  const openItemBefore = openItemId === null ? null : JSON.stringify(itemById(openItemId));
+  state.items = items ?? [];
+  renderTaskSummary();
+  if (openItemId === null) return;
+  if (JSON.stringify(itemById(openItemId)) !== openItemBefore) renderThread();
+}
+
+function renderTaskSummary() {
+  const visible = isManagerName(state.selected) && (state.items.length > 0 || state.schedules.length > 0);
+  elements.taskSummary.hidden = !visible;
+  if (!visible) {
+    elements.taskSummaryList.replaceChildren();
+    elements.scheduleList.replaceChildren();
+    return;
+  }
+  renderSchedules();
+  const countFor = (status) => state.items.filter((item) => item.status === status).length;
+  const counts = ["needs_input", "working", "done", "failed", "stopped"]
+    .filter((status) => countFor(status) > 0)
+    .map((status) => `${countFor(status)} ${ITEM_STATUS_LABELS[status]}`);
+  elements.taskSummaryCounts.textContent = counts.join(" - ");
+  elements.archiveDoneButton.hidden = countFor("done") === 0;
+  elements.archiveAllButton.hidden = state.items.length === 0;
+  elements.taskSummaryList.replaceChildren(...state.items.map((item, index) => taskSummaryRow(item, index + 1)));
+}
+
+function taskSummaryRow(item, number) {
+  const row = element("li", "task-item js-open-item");
+  row.dataset.itemId = String(item.id);
+  row.classList.toggle("is-open", state.openThread?.itemId === item.id);
+
+  const button = element("button", "task-item-button");
+  button.type = "button";
+  button.title = `Open the thread for ${item.title}`;
+  button.append(
+    element("span", "task-item-number", `${number}.`),
+    element("span", "task-item-title", item.title),
+    element("span", "task-item-member", item.member),
+  );
+  if (state.unreadItems.has(item.id)) button.append(element("span", "unread-badge", "new"));
+  button.append(itemStatusBadge(item.status));
+
+  const clearButton = element("button", "task-item-clear js-archive-item", "x");
+  clearButton.type = "button";
+  clearButton.title = `Remove ${item.title} from the list`;
+  clearButton.setAttribute("aria-label", clearButton.title);
+  const header = element("div", "task-item-header");
+  header.append(button, clearButton);
+  row.append(header);
+
+  if (item.summary) row.append(element("div", "task-item-summary", item.summary));
+  if (item.questions.length > 0) row.append(questionList(item.questions));
+  return row;
+}
+
+function renderSchedules() {
+  elements.scheduleSection.hidden = state.schedules.length === 0;
+  elements.scheduleList.replaceChildren(...state.schedules.map(scheduleRow));
+}
+
+function scheduleRow(schedule) {
+  const row = element("li", "task-item schedule-item t-schedule-item");
+  row.dataset.scheduleId = String(schedule.id);
+  row.title = schedule.instructions;
+
+  const label = element("div", "task-item-button");
+  label.append(
+    element("span", "schedule-time", scheduleTimeLabel(new Date(schedule.runAt))),
+    element("span", "task-item-title", schedule.title),
+  );
+  const cancelButton = element("button", "task-item-clear js-cancel-schedule", "x");
+  cancelButton.type = "button";
+  cancelButton.title = `Cancel ${schedule.title}`;
+  cancelButton.setAttribute("aria-label", cancelButton.title);
+  const header = element("div", "task-item-header");
+  header.append(label, cancelButton);
+  row.append(header);
+  return row;
+}
+
+// "Today 9:00 AM", "Tomorrow 2:30 PM" or "Mon, Oct 19 9:00 AM".
+function scheduleTimeLabel(date) {
+  const startOfDay = (value) => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+  const dayOffset = Math.round((startOfDay(date) - startOfDay(new Date())) / 86_400_000);
+  const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (dayOffset === 0) return `Today ${time}`;
+  if (dayOffset === 1) return `Tomorrow ${time}`;
+  return `${date.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })} ${time}`;
+}
+
+function itemStatusBadge(status) {
+  return element("span", `item-status item-status-${status}`, ITEM_STATUS_LABELS[status] ?? status);
+}
+
+// Clicking a question opens the thread with "q2: " ready to answer it.
+function questionList(questions) {
+  const list = element("ol", "question-list");
+  list.append(...questions.map((question, index) => {
+    const entry = element("li", "question js-answer-question");
+    entry.dataset.questionNumber = String(index + 1);
+    entry.title = "Answer this question";
+    entry.append(element("span", "question-label", `q${index + 1}:`), element("span", "question-text", question));
+    return entry;
+  }));
+  return list;
+}
+
+// The item as it stands, at the top of its thread.
+function itemCard(item) {
+  const card = element("div", "item-card");
+  const header = element("div", "item-card-header");
+  header.append(itemStatusBadge(item.status), element("span", "item-card-meta", `task #${item.id} - ${item.member}`));
+  card.append(header);
+  card.append(element("div", "item-card-summary", item.summary || "No summary yet."));
+  const report = itemReport(item.report ?? {});
+  if (report) card.append(report);
+  if (item.questions.length > 0) card.append(questionList(item.questions));
+  return card;
+}
+
+// Problem, fix, commit, specs and UI verification, as the Manager reported them.
+function itemReport(report) {
+  const rows = ITEM_REPORT_FIELDS.filter(([field]) => report[field]);
+  if (rows.length === 0) return null;
+  const list = element("dl", "item-report");
+  for (const [field, label] of rows) {
+    const value = element("dd", "item-report-value rich");
+    renderRichText(value, report[field]);
+    list.append(element("dt", "item-report-label", label), value);
+  }
+  return list;
 }
 
 // Consecutive messages from one author within a few minutes share a single
@@ -798,7 +990,7 @@ function appendEvent(event, view) {
 
 // Only a member's own messages in the main chat can be answered in a thread.
 function isThreadRoot(event) {
-  return event.kind === "assistant" && (event.thread_id ?? null) === null && event.id !== undefined;
+  return event.kind === "assistant" && (event.thread_id ?? null) === null && (event.item_id ?? null) === null && event.id !== undefined;
 }
 
 function addThreadControls(row, eventId) {
@@ -839,27 +1031,57 @@ function renderThreadSummary(rootId, summary = views.main.container.querySelecto
 
 function openThread(rootId) {
   if (!state.selected) return;
-  state.openThread = { member: state.selected, rootId };
+  showThreadPanel({ member: state.selected, rootId, itemId: null });
   state.unreadThreads.delete(rootId);
   renderThreadSummary(rootId);
-  elements.threadPanel.hidden = false;
-  elements.layout.classList.add("has-thread");
   renderThread();
   elements.threadInput.placeholder = `Reply to ${state.selected}...`;
   elements.threadInput.focus();
 }
 
+// Your replies in an item's thread go to the Manager, quoted with the item's open questions.
+function openItemThread(itemId, questionNumber = null) {
+  const manager = managerName();
+  const item = itemById(itemId);
+  if (!manager || !item) return;
+  if (state.selected !== manager) selectMember(manager);
+  if (state.openThread?.itemId !== itemId) {
+    showThreadPanel({ member: manager, rootId: null, itemId });
+    elements.threadInput.placeholder = `Reply about ${item.title}...`;
+    if (!state.itemEvents.has(itemId)) send({ type: "itemEvents", member: manager, itemId });
+  }
+  state.unreadItems.delete(itemId);
+  renderTaskSummary();
+  renderThread();
+  if (questionNumber !== null && !elements.threadInput.value.trim()) elements.threadInput.value = `q${questionNumber}: `;
+  elements.threadInput.focus();
+}
+
+function showThreadPanel(thread) {
+  if (state.openThread) threadComposer.clear();
+  state.openThread = thread;
+  elements.threadPanel.hidden = false;
+  elements.layout.classList.add("has-thread");
+}
+
 function closeThread() {
+  const hadItemThread = (state.openThread?.itemId ?? null) !== null;
   state.openThread = null;
   elements.threadPanel.hidden = true;
   elements.layout.classList.remove("has-thread");
-  elements.threadInput.value = "";
+  threadComposer.clear();
   resetView(views.thread);
+  if (hadItemThread) renderTaskSummary();
 }
 
 function renderThread() {
   const thread = state.openThread;
   if (!thread) return;
+  if (thread.itemId !== null) {
+    renderItemThread(thread.itemId);
+    return;
+  }
+  elements.threadTitle.textContent = "Thread";
   const history = state.histories.get(thread.member) ?? [];
   const root = history.find((event) => event.id === thread.rootId);
   if (!root) {
@@ -878,10 +1100,38 @@ function renderThread() {
   scrollToBottom(views.thread, true);
 }
 
+// The item as it stands, then its history: handoffs (collapsed), the Manager's updates, and your replies.
+function renderItemThread(itemId) {
+  const item = itemById(itemId);
+  if (!item) {
+    closeThread();
+    return;
+  }
+  elements.threadTitle.textContent = item.title;
+  elements.threadMeta.textContent = `with ${state.openThread.member} - ${ITEM_STATUS_LABELS[item.status] ?? item.status}`;
+  resetView(views.thread);
+  views.thread.container.append(itemCard(item));
+  const divider = element("div", "thread-divider");
+  divider.append(element("span", "thread-divider-label", "History"));
+  views.thread.container.append(divider);
+  const events = state.itemEvents.get(itemId);
+  if (!events) views.thread.container.append(element("div", "note note-system", "Loading..."));
+  for (const event of events ?? []) {
+    if (event.kind !== "tool") appendEvent(event, views.thread);
+  }
+  renderStreamingBubbles();
+  scrollToBottom(views.thread, true);
+}
+
+function threadEvents(thread) {
+  if (thread.itemId !== null) return state.itemEvents.get(thread.itemId) ?? [];
+  return threadReplies(thread.member, thread.rootId);
+}
+
 function authorFor(event) {
   if (event.kind === "user") return { key: "you", name: "You" };
   if (event.kind === "assistant") return { key: state.selected, name: state.selected };
-  if (event.kind === "task") {
+  if (event.kind === "task" || event.kind === "item") {
     const manager = [...state.members.values()].find((member) => member.isManager)?.name ?? "manager";
     return { key: manager, name: manager };
   }
@@ -965,8 +1215,9 @@ function shortTime(date) {
   return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
-// Light formatting for agent output: ``` code blocks, `inline code`, **bold**
-// and # headings. Builds DOM nodes only; message text is never parsed as HTML.
+// Light formatting for agent output: ``` code blocks, `inline code`, **bold**,
+// # headings and | pipe | tables |. Builds DOM nodes only; message text is
+// never parsed as HTML.
 function renderRichText(container, text) {
   text.split("```").forEach((part, index) => {
     if (index % 2 === 1) {
@@ -975,15 +1226,93 @@ function renderRichText(container, text) {
     }
     const trimmed = part.replace(/^\n+|\n+$/g, "");
     if (!trimmed) return;
-    const paragraph = element("div", "rich-text");
-    trimmed.split("\n").forEach((line, lineIndex) => {
-      if (lineIndex > 0) paragraph.append("\n");
-      const heading = line.match(/^#{1,6}\s+(.*)$/);
-      if (heading) paragraph.append(element("strong", "rich-heading", heading[1]));
-      else appendInlineText(paragraph, line);
-    });
-    container.append(paragraph);
+    const lines = trimmed.split("\n");
+    let paragraphLines = [];
+    const flushParagraph = () => {
+      const content = paragraphLines.join("\n").replace(/^\n+|\n+$/g, "");
+      paragraphLines = [];
+      if (!content) return;
+      const paragraph = element("div", "rich-text");
+      content.split("\n").forEach((line, lineIndex) => {
+        if (lineIndex > 0) paragraph.append("\n");
+        const heading = line.match(/^#{1,6}\s+(.*)$/);
+        if (heading) paragraph.append(element("strong", "rich-heading", heading[1]));
+        else appendInlineText(paragraph, line);
+      });
+      container.append(paragraph);
+    };
+    let lineIndex = 0;
+    while (lineIndex < lines.length) {
+      if (!isTableStart(lines, lineIndex)) {
+        paragraphLines.push(lines[lineIndex]);
+        lineIndex += 1;
+        continue;
+      }
+      flushParagraph();
+      const tableLines = [lines[lineIndex]];
+      lineIndex += 2;
+      while (lineIndex < lines.length && isTableRow(lines[lineIndex])) {
+        tableLines.push(lines[lineIndex]);
+        lineIndex += 1;
+      }
+      container.append(renderTable(tableLines));
+    }
+    flushParagraph();
   });
+}
+
+function isTableRow(line) {
+  return /^\s*\|.*\|\s*$/.test(line);
+}
+
+function isTableStart(lines, index) {
+  const separator = lines[index + 1];
+  return isTableRow(lines[index]) && separator !== undefined && /^\s*\|(\s*:?-+:?\s*\|)+\s*$/.test(separator);
+}
+
+// Splits "| a | `b|c` |" into ["a", "`b|c`"], ignoring pipes inside inline code.
+function tableCells(line) {
+  const cells = [];
+  let current = "";
+  let inCode = false;
+  for (const character of line.trim().replace(/^\|/, "").replace(/\|$/, "")) {
+    if (character === "`") inCode = !inCode;
+    if (character === "|" && !inCode) {
+      cells.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function renderTable(tableLines) {
+  const wrapper = element("div", "rich-table-wrap");
+  const table = element("table", "rich-table");
+  const [headerLine, ...bodyLines] = tableLines;
+  const headerRow = element("tr");
+  tableCells(headerLine).forEach((cell) => {
+    const headerCell = element("th");
+    appendInlineText(headerCell, cell);
+    headerRow.append(headerCell);
+  });
+  table.append(element("thead"));
+  table.tHead.append(headerRow);
+  const tableBody = element("tbody");
+  bodyLines.forEach((line) => {
+    const row = element("tr");
+    tableCells(line).forEach((cell) => {
+      const dataCell = element("td");
+      appendInlineText(dataCell, cell);
+      row.append(dataCell);
+    });
+    tableBody.append(row);
+  });
+  table.append(tableBody);
+  wrapper.append(table);
+  return wrapper;
 }
 
 function appendInlineText(node, text) {
@@ -1001,10 +1330,12 @@ function appendInlineText(node, text) {
 
 // Text being typed shows where it will land: in the open thread or the main chat.
 function renderStreamingBubbles() {
-  const threadId = state.streamingThread.get(state.selected) ?? null;
-  const showsInThread = threadId !== null && state.openThread?.member === state.selected && state.openThread.rootId === threadId;
-  renderStreamingBubble(views.main, threadId === null);
-  renderStreamingBubble(views.thread, showsInThread);
+  const placement = state.streamingPlacement.get(state.selected) ?? {};
+  const pendingEvent = {
+    kind: "assistant", thread_id: placement.threadId ?? null, item_id: placement.itemId ?? null, origin: placement.origin ?? null,
+  };
+  renderStreamingBubble(views.main, showsInMain(state.selected, pendingEvent));
+  renderStreamingBubble(views.thread, isInOpenThread(state.selected, pendingEvent));
 }
 
 function renderStreamingBubble(view, visible) {
@@ -1047,11 +1378,37 @@ function applyTheme(theme) {
   }
 }
 
+const API_MODE_HINTS = {
+  off: "Members always use your Claude plan.",
+  fallback: "Members that hit your Claude plan limit restart on the API key, continue their turn, and switch back when the limit resets.",
+  always: "Every member runs on the API key instead of your Claude plan. Usage is billed to the key's Console account.",
+};
+
+function renderApiModeHint() {
+  elements.apiModeHint.textContent = API_MODE_HINTS[elements.apiFields.elements.apiMode.value] ?? "";
+}
+
+function renderApiFallbackStatus() {
+  const until = state.workspace?.apiSettings?.apiFallbackUntil;
+  elements.apiFallbackStatus.hidden = !until;
+  if (until) elements.apiFallbackStatus.textContent = `Plan limit reached: members use the API key until ${formatClockTime(until)}.`;
+}
+
+function formatClockTime(milliseconds) {
+  return new Date(milliseconds).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 function renderRateLimit(rateLimit) {
+  const fallbackUntil = state.workspace?.apiSettings?.apiFallbackUntil;
+  if (fallbackUntil) {
+    elements.rateLimit.textContent = `Plan limit reached: on API key until ${formatClockTime(fallbackUntil)}`;
+    elements.rateLimit.dataset.status = "api";
+    return;
+  }
   if (!rateLimit) return;
   const resetsAt = rateLimit.resetsAt ? new Date(rateLimit.resetsAt * 1000) : null;
   const window = String(rateLimit.rateLimitType ?? "").replace("_", "-");
-  const resetText = resetsAt ? `, resets ${resetsAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "";
+  const resetText = resetsAt ? `, resets ${formatClockTime(resetsAt)}` : "";
   elements.rateLimit.textContent = `Plan limit (${window}): ${rateLimit.status}${resetText}`;
   elements.rateLimit.dataset.status = rateLimit.status;
 }
@@ -1075,7 +1432,82 @@ function formatTokens(tokens) {
   return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens);
 }
 
-// ---------------------------------------------------------------- attachments
+// ---------------------------------------------------------------- composers
+
+function createComposer(form) {
+  form.append(document.querySelector(".js-composer-template").content.cloneNode(true));
+  const composer = {
+    form,
+    input: form.querySelector(".js-composer-input"),
+    attachments: [],
+    attachmentList: form.querySelector(".js-attachment-list"),
+    error: form.querySelector(".js-composer-error"),
+    fileInput: form.querySelector(".js-file-input"),
+  };
+  form.querySelector(".js-composer-hint").textContent = form.dataset.hint ?? "";
+
+  composer.showError = (message) => {
+    composer.error.textContent = message;
+    composer.error.hidden = false;
+  };
+  composer.hideError = () => {
+    composer.error.hidden = true;
+  };
+  composer.addFiles = (files) => addFiles(composer, files);
+  composer.render = () => renderAttachments(composer);
+  composer.clear = () => {
+    composer.input.value = "";
+    composer.hideError();
+    for (const attachment of composer.attachments) if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+    composer.attachments = [];
+    composer.render();
+  };
+  // What the server needs: the preview URL stays in the browser.
+  composer.payloadAttachments = () => composer.attachments.map(({ name, kind, mediaType, data }) => ({ name, kind, mediaType, data }));
+  composer.isEmpty = () => !composer.input.value.trim() && composer.attachments.length === 0;
+
+  form.querySelector(".js-attach").addEventListener("click", () => composer.fileInput.click());
+
+  composer.fileInput.addEventListener("change", () => {
+    composer.addFiles([...composer.fileInput.files]);
+    composer.fileInput.value = "";
+  });
+
+  composer.input.addEventListener("paste", (pasteEvent) => {
+    const files = [...(pasteEvent.clipboardData?.files ?? [])];
+    if (files.length === 0) return;
+    pasteEvent.preventDefault();
+    composer.addFiles(files);
+  });
+
+  form.addEventListener("dragover", (dragEvent) => {
+    if (!dragEvent.dataTransfer?.types.includes("Files")) return;
+    dragEvent.preventDefault();
+    form.classList.add("is-dragging");
+  });
+
+  form.addEventListener("dragleave", (dragEvent) => {
+    if (!form.contains(dragEvent.relatedTarget)) form.classList.remove("is-dragging");
+  });
+
+  form.addEventListener("drop", (dropEvent) => {
+    form.classList.remove("is-dragging");
+    const files = [...(dropEvent.dataTransfer?.files ?? [])];
+    if (files.length === 0) return;
+    dropEvent.preventDefault();
+    composer.addFiles(files);
+  });
+
+  composer.attachmentList.addEventListener("click", (clickEvent) => {
+    const removeButton = clickEvent.target.closest(".js-attachment-remove");
+    if (!removeButton) return;
+    const [removed] = composer.attachments.splice(Number(removeButton.dataset.index), 1);
+    if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+    composer.render();
+  });
+
+  return composer;
+}
 
 function attachmentKind(file) {
   if (file.type === "application/pdf" || /\.pdf$/i.test(file.name)) return "pdf";
@@ -1083,25 +1515,26 @@ function attachmentKind(file) {
   return "text";
 }
 
-async function addFiles(files) {
-  hideComposerError();
+async function addFiles(composer, files) {
+  composer.hideError();
   for (const file of files) {
-    if (state.attachments.length >= ATTACHMENT_LIMIT) {
-      showComposerError(`Attach at most ${ATTACHMENT_LIMIT} files per message.`);
+    if (composer.attachments.length >= ATTACHMENT_LIMIT) {
+      composer.showError(`Attach at most ${ATTACHMENT_LIMIT} files per message.`);
       break;
     }
     try {
-      state.attachments.push(await readAttachment(file));
+      composer.attachments.push(await readAttachment(file));
     } catch (error) {
-      showComposerError(error.message);
+      composer.showError(error.message);
     }
   }
-  const totalBytes = state.attachments.reduce((sum, attachment) => sum + attachment.size, 0);
+  const totalBytes = composer.attachments.reduce((sum, attachment) => sum + attachment.size, 0);
   if (totalBytes > MAX_TOTAL_BYTES) {
-    const removed = state.attachments.pop();
-    showComposerError(`${removed.name}: attachments are limited to 24 MB per message.`);
+    const removed = composer.attachments.pop();
+    if (removed.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+    composer.showError(`${removed.name}: attachments are limited to 24 MB per message.`);
   }
-  renderAttachments();
+  composer.render();
 }
 
 async function readAttachment(file) {
@@ -1133,9 +1566,9 @@ function readAsBase64(file) {
   });
 }
 
-function renderAttachments() {
-  elements.attachmentList.hidden = state.attachments.length === 0;
-  elements.attachmentList.replaceChildren(...state.attachments.map((attachment, index) => {
+function renderAttachments(composer) {
+  composer.attachmentList.hidden = composer.attachments.length === 0;
+  composer.attachmentList.replaceChildren(...composer.attachments.map((attachment, index) => {
     const item = element("li", "attachment");
     if (attachment.previewUrl) {
       const preview = element("img", "attachment-preview");
@@ -1153,21 +1586,6 @@ function renderAttachments() {
     item.append(removeButton);
     return item;
   }));
-}
-
-function clearAttachments() {
-  for (const attachment of state.attachments) if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
-  state.attachments = [];
-  renderAttachments();
-}
-
-function showComposerError(message) {
-  elements.composerError.textContent = message;
-  elements.composerError.hidden = false;
-}
-
-function hideComposerError() {
-  elements.composerError.hidden = true;
 }
 
 function formatBytes(bytes) {
@@ -1256,24 +1674,22 @@ function applyMemberOrder(order) {
   const position = new Map(order.map((name, index) => [name, index]));
   const byPosition = (first, second) => (position.get(first) ?? Infinity) - (position.get(second) ?? Infinity);
   state.order = [...state.order].sort(byPosition);
-  state.memberConfigs = [...state.memberConfigs].sort((first, second) => byPosition(first.name, second.name));
   renderMemberList();
 }
 
 elements.composer.addEventListener("submit", (submitEvent) => {
   submitEvent.preventDefault();
   const text = elements.input.value.trim();
-  if ((!text && state.attachments.length === 0) || !state.selected) return;
-  const attachments = state.attachments.map(({ name, kind, mediaType, data }) => ({ name, kind, mediaType, data }));
+  if (mainComposer.isEmpty() || !state.selected) return;
+  const attachments = mainComposer.payloadAttachments();
+  state.lastComposer = mainComposer;
   const directMention = text.match(/^@(\S+)\s+([\s\S]+)/);
   if (directMention && state.members.has(directMention[1])) {
     send({ type: "send", member: directMention[1], text: directMention[2], attachments });
   } else {
     send({ type: "send", member: state.selected, text, attachments });
   }
-  elements.input.value = "";
-  hideComposerError();
-  clearAttachments();
+  mainComposer.clear();
 });
 
 elements.messages.addEventListener("click", (clickEvent) => {
@@ -1281,12 +1697,42 @@ elements.messages.addEventListener("click", (clickEvent) => {
   if (button) openThread(Number(button.dataset.threadId));
 });
 
+elements.taskSummaryList.addEventListener("click", (clickEvent) => {
+  const row = clickEvent.target.closest(".js-open-item");
+  if (!row) return;
+  if (clickEvent.target.closest(".js-archive-item")) {
+    send({ type: "archiveItem", workspace: currentWorkspace(), itemId: Number(row.dataset.itemId) });
+    return;
+  }
+  const question = clickEvent.target.closest(".js-answer-question");
+  openItemThread(Number(row.dataset.itemId), question ? Number(question.dataset.questionNumber) : null);
+});
+
+elements.scheduleList.addEventListener("click", (clickEvent) => {
+  const cancelButton = clickEvent.target.closest(".js-cancel-schedule");
+  if (!cancelButton) return;
+  const row = cancelButton.closest("[data-schedule-id]");
+  send({ type: "cancelSchedule", workspace: currentWorkspace(), scheduleId: Number(row.dataset.scheduleId) });
+});
+
+elements.threadMessages.addEventListener("click", (clickEvent) => {
+  const question = clickEvent.target.closest(".js-answer-question");
+  if (!question || (state.openThread?.itemId ?? null) === null) return;
+  openItemThread(state.openThread.itemId, Number(question.dataset.questionNumber));
+});
+
+elements.archiveDoneButton.addEventListener("click", () => send({ type: "archiveDoneItems", workspace: currentWorkspace() }));
+elements.archiveAllButton.addEventListener("click", () => send({ type: "archiveAllItems", workspace: currentWorkspace() }));
+elements.toggleActivityButton.addEventListener("click", () => setShowActivity(!state.showActivity));
+
 elements.threadComposer.addEventListener("submit", (submitEvent) => {
   submitEvent.preventDefault();
-  const text = elements.threadInput.value.trim();
-  if (!text || !state.openThread) return;
-  send({ type: "send", member: state.openThread.member, text, threadId: state.openThread.rootId });
-  elements.threadInput.value = "";
+  const thread = state.openThread;
+  if (threadComposer.isEmpty() || !thread) return;
+  const target = thread.itemId !== null ? { itemId: thread.itemId } : { threadId: thread.rootId };
+  state.lastComposer = threadComposer;
+  send({ type: "send", member: thread.member, text: threadComposer.input.value.trim(), attachments: threadComposer.payloadAttachments(), ...target });
+  threadComposer.clear();
 });
 
 elements.threadInput.addEventListener("keydown", (keyEvent) => {
@@ -1295,58 +1741,130 @@ elements.threadInput.addEventListener("keydown", (keyEvent) => {
     elements.input.focus();
     return;
   }
+  if (isRecallKey(keyEvent, elements.threadInput) && state.openThread) {
+    keyEvent.preventDefault();
+    recallLastMessage(elements.threadInput, lastSentText(threadEvents(state.openThread)));
+    return;
+  }
   if (keyEvent.key === "Enter" && !keyEvent.shiftKey && !keyEvent.isComposing) {
     keyEvent.preventDefault();
     elements.threadComposer.requestSubmit();
   }
 });
 
+// Arrow Up in an empty composer brings back your last message to edit and resend,
+// like a shell history or Slack's "edit last message".
+function isRecallKey(keyEvent, input) {
+  if (keyEvent.key !== "ArrowUp" || keyEvent.isComposing) return false;
+  if (keyEvent.shiftKey || keyEvent.altKey || keyEvent.ctrlKey || keyEvent.metaKey) return false;
+  return input.value === "";
+}
+
+function lastSentText(events) {
+  return events.findLast((event) => event.kind === "user")?.text ?? null;
+}
+
+function mainChatEvents(memberName) {
+  return (state.histories.get(memberName) ?? []).filter((event) => (event.thread_id ?? null) === null && (event.item_id ?? null) === null);
+}
+
+function recallLastMessage(input, text) {
+  if (!text) return;
+  input.value = text;
+  input.setSelectionRange(text.length, text.length);
+  input.dispatchEvent(new Event("input"));
+}
+
 elements.closeThreadButton.addEventListener("click", () => {
   closeThread();
   elements.input.focus();
 });
 
-elements.attachButton.addEventListener("click", () => elements.fileInput.click());
+const threadWidthDefault = 400;
+const threadWidthMinimum = 320;
+const sidebarWidth = 260;
+const mainColumnMinimum = 360;
+const threadWidthKeyboardStep = 24;
 
-elements.fileInput.addEventListener("change", () => {
-  addFiles([...elements.fileInput.files]);
-  elements.fileInput.value = "";
+function clampThreadWidth(width) {
+  const maximum = Math.max(threadWidthMinimum, window.innerWidth - sidebarWidth - mainColumnMinimum);
+  return Math.round(Math.min(Math.max(width, threadWidthMinimum), maximum));
+}
+
+function currentThreadWidth() {
+  return elements.threadPanel.getBoundingClientRect().width || threadWidthDefault;
+}
+
+function applyThreadWidth(width) {
+  const clampedWidth = clampThreadWidth(width);
+  elements.layout.style.setProperty("--thread-width", `${clampedWidth}px`);
+  elements.threadResizeHandle.setAttribute("aria-valuenow", String(clampedWidth));
+  return clampedWidth;
+}
+
+function savedThreadWidth() {
+  try {
+    const width = Number(localStorage.getItem("vdev.threadWidth"));
+    return width > 0 ? width : threadWidthDefault;
+  } catch {
+    return threadWidthDefault;
+  }
+}
+
+function saveThreadWidth(width) {
+  try {
+    localStorage.setItem("vdev.threadWidth", String(width));
+  } catch {
+    // storage unavailable; the width lasts until the page reloads
+  }
+}
+
+elements.threadResizeHandle.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  const handle = elements.threadResizeHandle;
+  const startX = event.clientX;
+  const startWidth = currentThreadWidth();
+  let latestWidth = startWidth;
+  handle.setPointerCapture(event.pointerId);
+  handle.classList.add("is-dragging");
+  elements.layout.classList.add("is-resizing-thread");
+
+  const onMove = (moveEvent) => {
+    latestWidth = applyThreadWidth(startWidth + (startX - moveEvent.clientX));
+  };
+  const onEnd = () => {
+    handle.removeEventListener("pointermove", onMove);
+    handle.removeEventListener("pointerup", onEnd);
+    handle.removeEventListener("pointercancel", onEnd);
+    handle.classList.remove("is-dragging");
+    elements.layout.classList.remove("is-resizing-thread");
+    saveThreadWidth(latestWidth);
+  };
+  handle.addEventListener("pointermove", onMove);
+  handle.addEventListener("pointerup", onEnd);
+  handle.addEventListener("pointercancel", onEnd);
 });
 
-elements.input.addEventListener("paste", (pasteEvent) => {
-  const files = [...(pasteEvent.clipboardData?.files ?? [])];
-  if (files.length === 0) return;
-  pasteEvent.preventDefault();
-  addFiles(files);
+elements.threadResizeHandle.addEventListener("dblclick", () => {
+  saveThreadWidth(applyThreadWidth(threadWidthDefault));
 });
 
-elements.composer.addEventListener("dragover", (dragEvent) => {
-  if (!dragEvent.dataTransfer?.types.includes("Files")) return;
-  dragEvent.preventDefault();
-  elements.composer.classList.add("is-dragging");
+elements.threadResizeHandle.addEventListener("keydown", (event) => {
+  const direction = { ArrowLeft: 1, ArrowRight: -1 }[event.key];
+  if (!direction) return;
+  event.preventDefault();
+  saveThreadWidth(applyThreadWidth(currentThreadWidth() + direction * threadWidthKeyboardStep));
 });
 
-elements.composer.addEventListener("dragleave", (dragEvent) => {
-  if (!elements.composer.contains(dragEvent.relatedTarget)) elements.composer.classList.remove("is-dragging");
-});
-
-elements.composer.addEventListener("drop", (dropEvent) => {
-  elements.composer.classList.remove("is-dragging");
-  const files = [...(dropEvent.dataTransfer?.files ?? [])];
-  if (files.length === 0) return;
-  dropEvent.preventDefault();
-  addFiles(files);
-});
-
-elements.attachmentList.addEventListener("click", (clickEvent) => {
-  const removeButton = clickEvent.target.closest(".js-attachment-remove");
-  if (!removeButton) return;
-  const [removed] = state.attachments.splice(Number(removeButton.dataset.index), 1);
-  if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
-  renderAttachments();
-});
+window.addEventListener("resize", () => applyThreadWidth(savedThreadWidth()));
 
 elements.input.addEventListener("keydown", (keyEvent) => {
+  if (isRecallKey(keyEvent, elements.input)) {
+    keyEvent.preventDefault();
+    recallLastMessage(elements.input, lastSentText(mainChatEvents(state.selected)));
+    return;
+  }
   if (keyEvent.key === "Enter" && !keyEvent.shiftKey && !keyEvent.isComposing) {
     keyEvent.preventDefault();
     elements.composer.requestSubmit();
@@ -1400,71 +1918,59 @@ elements.allowAllPermissionsButton.addEventListener("click", () => {
 elements.resetButton.addEventListener("click", () => send({ type: "reset", member: state.selected }));
 elements.stopButton.addEventListener("click", () => send({ type: "stop", member: state.selected }));
 
-elements.addMemberButton.addEventListener("click", () => openMemberEditor(null));
-elements.editMemberButton.addEventListener("click", () => openMemberEditor(state.selected));
-elements.cancelMemberButton.addEventListener("click", () => elements.memberDialog.close());
-elements.permissionsButton.addEventListener("click", () => openSettings(state.selected));
-elements.openSettingsButton.addEventListener("click", () => openSettings());
+elements.addWorkerButton.addEventListener("click", () => send({ type: "addWorker" }));
+elements.openSettingsButton.addEventListener("click", () => {
+  if (elements.settingsPage.hidden) openSettings();
+  else closeSettings();
+});
 elements.closeSettingsButton.addEventListener("click", closeSettings);
-elements.settingsForm.elements.chrome.addEventListener("change", syncMemberChromeSwitches);
+elements.apiFields.addEventListener("change", renderApiModeHint);
+
+for (const select of elements.settingsForm.querySelectorAll(".js-model-select")) {
+  select.addEventListener("change", () => {
+    const fieldset = select.closest(".js-agent-fields");
+    syncCustomModelField(fieldset);
+    if (select.value === "custom") fieldset.elements.customModel.focus();
+  });
+}
 
 elements.settingsForm.addEventListener("submit", (submitEvent) => {
   submitEvent.preventDefault();
   elements.settingsError.hidden = true;
   elements.settingsStatus.textContent = "Saving...";
-  const fields = elements.settingsForm.elements;
-  const members = {};
-  for (const textarea of elements.settingsMembers.querySelectorAll(".js-settings-member-rules")) {
-    members[textarea.dataset.member] = { allowedTools: ruleLines(textarea.value) };
-  }
-  // A Chrome switch is only sent when changed, so untouched members keep following their default.
-  for (const checkbox of elements.settingsMembers.querySelectorAll(".js-settings-member-chrome")) {
-    const chrome = memberChromeValue(checkbox);
-    if (String(chrome) !== checkbox.dataset.initial) members[checkbox.dataset.member].chrome = chrome;
-  }
+  const projectFields = elements.projectFields.elements;
   send({
-    type: "saveProjectSettings",
+    type: "saveSettings",
     workspace: currentWorkspace(),
-    instructions: fields.instructions.value,
-    allowedTools: ruleLines(fields.allowedTools.value),
-    chrome: fields.chrome.checked,
-    sharePermissions: fields.sharePermissions.checked,
-    members,
+    worker: agentFieldValues(agentFieldset("worker")),
+    manager: agentFieldValues(agentFieldset("manager")),
+    instructions: projectFields.instructions.value,
+    allowedTools: ruleLines(projectFields.allowedTools.value),
+    apiKey: elements.apiFields.elements.apiKey.value,
+    clearApiKey: elements.apiFields.elements.clearApiKey.checked,
+    apiMode: elements.apiFields.elements.apiMode.value,
   });
 });
 
-elements.memberForm.addEventListener("submit", (submitEvent) => {
-  submitEvent.preventDefault();
-  elements.memberFormError.hidden = true;
-  const config = memberFormValues();
-  if (!config.originalName) state.pendingSelection = config.name;
-  const templateName = elements.memberForm.elements.template.value;
-  send({ type: "saveMember", config, copyPermissionsFrom: config.originalName ? undefined : templateName || undefined });
-});
-
-elements.memberForm.elements.template.addEventListener("change", () => {
-  applyTemplate(elements.memberForm.elements.template.value);
-});
-
-elements.memberForm.elements.model.addEventListener("change", () => {
-  syncCustomModelField();
-  if (elements.memberForm.elements.model.value === "custom") elements.memberForm.elements.customModel.focus();
-});
-
-elements.removeMemberButton.addEventListener("click", () => {
-  if (!state.editingMember) return;
-  if (!elements.removeMemberButton.dataset.armed) {
-    elements.removeMemberButton.dataset.armed = "true";
-    elements.removeMemberButton.textContent = `Click again to remove ${state.editingMember}`;
+elements.removeWorkerButton.addEventListener("click", () => {
+  const workerName = elements.removeWorkerButton.dataset.member;
+  if (!workerName) return;
+  if (!elements.removeWorkerButton.dataset.armed) {
+    elements.removeWorkerButton.dataset.armed = "true";
+    elements.removeWorkerButton.textContent = `Click again to remove ${workerName}`;
     return;
   }
   resetRemoveButton();
-  send({ type: "removeMember", name: state.editingMember });
+  send({ type: "removeWorker", name: workerName });
 });
 
 for (const option of elements.themeOptions) {
   option.addEventListener("click", () => applyTheme(option.dataset.themeChoice));
 }
+renderAgentSelects();
 applyTheme(savedTheme());
+state.showActivity = savedShowActivity();
+renderActivityToggle();
+applyThreadWidth(savedThreadWidth());
 
 connect();

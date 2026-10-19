@@ -4,247 +4,44 @@
     "~/code"
   ],
   "idleMinutes": 10,
-  "commands": [
-    "cm",
-    "br"
-  ],
-  "members": [
-    {
-      "name": "manager",
-      "role": "manager",
-      "model": "sonnet",
-      "effort": "medium",
-      "tools": [
-        "Read",
-        "Glob",
-        "Grep"
-      ],
-      "budget": 200000,
-      "prompt": "You are the Manager of a small software team. You do not write code yourself. Break the user's request into focused tasks and assign them with the delegate_task tool. Give every brief clear acceptance criteria and the relevant files. Run independent tasks in parallel. Ask the user when requirements are unclear instead of guessing. When handoffs arrive, check them against the acceptance criteria and report back to the user in a few short lines."
-    },
-    {
-      "name": "ui",
-      "role": "UI developer (Hotwire, views, CSS)",
-      "model": "sonnet",
-      "prompt": "You are the UI developer. You own views, Stimulus controllers, Turbo, and stylesheets. Keep logic in helpers, not views.",
-      "effort": "medium",
-      "budget": 150000,
-      "chrome": true,
-      "allowedTools": [
-        "Read",
-        "Edit",
-        "Write",
-        "Glob",
-        "Grep",
-        "Bash(git status *)",
-        "Bash(git diff *)"
-      ]
-    },
-    {
-      "name": "designer",
-      "role": "Product designer (writes specs, no code)",
-      "model": "sonnet",
-      "prompt": "You are the Product designer. You write concise UX specs as markdown files under docs/specs/. You never edit application code.",
-      "effort": "low",
-      "budget": 80000,
-      "chrome": true,
-      "tools": [
-        "Read",
-        "Glob",
-        "Grep",
-        "Write"
-      ],
-      "allowedTools": [
-        "Read",
-        "Glob",
-        "Grep",
-        "Write(docs/specs/**)"
-      ]
-    },
-    {
-      "name": "devops",
-      "role": "DevOps engineer (config, CI, deploy)",
-      "model": "haiku",
-      "budget": 100000,
-      "allowedTools": [
-        "Read",
-        "Edit",
-        "Glob",
-        "Grep",
-        "Bash(git status *)",
-        "Bash(git diff *)"
-      ],
-      "prompt": "You are the DevOps engineer. You own CI, Docker, Kamal and environment configuration. Never run deploy commands; describe them instead."
-    },
-    {
-      "name": "qa",
-      "role": "QA engineer (runs and reviews tests)",
-      "model": "haiku",
-      "prompt": "You are the QA engineer. Run the relevant specs, review coverage for negative and edge cases, and report failures with exact file and line. Do not edit application code.",
-      "budget": 100000,
-      "chrome": true,
-      "allowedTools": [
-        "Read",
-        "Glob",
-        "Grep",
-        "Bash(bundle exec rspec *)",
-        "Bash(git diff *)"
-      ]
-    },
-    {
-      "name": "qa2",
-      "role": "QA engineer (runs and reviews tests)",
-      "model": "haiku",
-      "prompt": "You are the QA engineer. Run the relevant specs, review coverage for negative and edge cases, and report failures with exact file and line. Do not edit application code.",
-      "budget": 100000,
-      "chrome": true,
-      "allowedTools": [
-        "Read",
-        "Glob",
-        "Grep",
-        "Bash(bundle exec rspec *)",
-        "Bash(git diff *)"
-      ]
-    },
-    {
-      "name": "qa3",
-      "role": "QA engineer (runs and reviews tests)",
-      "model": "haiku",
-      "prompt": "You are the QA engineer. Run the relevant specs, review coverage for negative and edge cases, and report failures with exact file and line. Do not edit application code.",
-      "budget": 100000,
-      "chrome": true,
-      "allowedTools": [
-        "Read",
-        "Glob",
-        "Grep",
-        "Bash(bundle exec rspec *)",
-        "Bash(git diff *)"
-      ]
-    },
-    {
-      "name": "qa4",
-      "role": "QA engineer (runs and reviews tests)",
-      "model": "haiku",
-      "prompt": "You are the QA engineer. Run the relevant specs, review coverage for negative and edge cases, and report failures with exact file and line. Do not edit application code.",
-      "budget": 100000,
-      "chrome": true,
-      "allowedTools": [
-        "Read",
-        "Glob",
-        "Grep",
-        "Bash(bundle exec rspec *)",
-        "Bash(git diff *)"
-      ]
-    },
-    {
-      "name": "qa5",
-      "role": "QA engineer (runs and reviews tests)",
-      "model": "haiku",
-      "prompt": "You are the QA engineer. Run the relevant specs, review coverage for negative and edge cases, and report failures with exact file and line. Do not edit application code.",
-      "budget": 100000,
-      "chrome": true,
-      "allowedTools": [
-        "Read",
-        "Glob",
-        "Grep",
-        "Bash(bundle exec rspec *)",
-        "Bash(git diff *)"
-      ]
-    },
-    {
-      "name": "backend",
-      "role": "Backend Rails developer",
-      "model": "sonnet",
-      "effort": "medium",
-      "budget": 150000,
-      "allowedTools": [
-        "Read",
-        "Edit",
-        "Write",
-        "Glob",
-        "Grep",
-        "Bash(bin/rails *)",
-        "Bash(bundle exec *)",
-        "Bash(git status *)",
-        "Bash(git diff *)"
-      ],
-      "prompt": "You are the Backend Rails developer. Follow the project's conventions and CLAUDE.md. Write request specs for new behavior and run them."
-    },
-    {
-      "name": "backend2",
-      "role": "Backend Rails developer",
-      "model": "sonnet",
-      "prompt": "You are the Backend Rails developer. Follow the project's conventions and CLAUDE.md. Write request specs for new behavior and run them.",
-      "effort": "medium",
-      "budget": 150000,
-      "allowedTools": [
-        "Read",
-        "Edit",
-        "Write",
-        "Glob",
-        "Grep",
-        "Bash(bin/rails *)",
-        "Bash(bundle exec *)",
-        "Bash(git status *)",
-        "Bash(git diff *)"
-      ]
-    },
-    {
-      "name": "backend3",
-      "role": "Backend Rails developer",
-      "model": "sonnet",
-      "prompt": "You are the Backend Rails developer. Follow the project's conventions and CLAUDE.md. Write request specs for new behavior and run them.",
-      "effort": "medium",
-      "budget": 150000,
-      "allowedTools": [
-        "Read",
-        "Edit",
-        "Write",
-        "Glob",
-        "Grep",
-        "Bash(bin/rails *)",
-        "Bash(bundle exec *)",
-        "Bash(git status *)",
-        "Bash(git diff *)"
-      ]
-    },
-    {
-      "name": "backend4",
-      "role": "Backend Rails developer",
-      "model": "sonnet",
-      "prompt": "You are the Backend Rails developer. Follow the project's conventions and CLAUDE.md. Write request specs for new behavior and run them.",
-      "effort": "medium",
-      "budget": 150000,
-      "allowedTools": [
-        "Read",
-        "Edit",
-        "Write",
-        "Glob",
-        "Grep",
-        "Bash(bin/rails *)",
-        "Bash(bundle exec *)",
-        "Bash(git status *)",
-        "Bash(git diff *)"
-      ]
-    },
-    {
-      "name": "backend5",
-      "role": "Backend Rails developer",
-      "model": "sonnet",
-      "prompt": "You are the Backend Rails developer. Follow the project's conventions and CLAUDE.md. Write request specs for new behavior and run them.",
-      "effort": "medium",
-      "budget": 150000,
-      "allowedTools": [
-        "Read",
-        "Edit",
-        "Write",
-        "Glob",
-        "Grep",
-        "Bash(bin/rails *)",
-        "Bash(bundle exec *)",
-        "Bash(git status *)",
-        "Bash(git diff *)"
-      ]
-    }
+  "manager": {
+    "model": "claude-opus-5-5",
+    "effort": "medium",
+    "tools": [
+      "Read",
+      "Glob",
+      "Grep"
+    ],
+    "prompt": "You are the Manager of a small software team. You do not write code yourself. Break the user's request into focused tasks and assign them with the delegate_task tool. Give every brief clear acceptance criteria and the relevant files. Run independent tasks in parallel. Ask the user when requirements are unclear instead of guessing. When handoffs arrive, check them against the acceptance criteria and report back to the user in a few short lines."
+  },
+  "worker": {
+    "budget": 500000,
+    "chrome": true,
+    "allowedTools": [
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "Bash(git status *)",
+      "Bash(git diff *)"
+    ],
+    "model": "claude-sonnet-5-5",
+    "effort": "medium"
+  },
+  "workers": [
+    "worker1",
+    "worker2",
+    "worker3",
+    "worker4",
+    "worker5",
+    "worker6",
+    "worker7",
+    "worker8",
+    "worker9",
+    "worker10",
+    "worker11",
+    "worker12",
+    "worker13"
   ]
 }
