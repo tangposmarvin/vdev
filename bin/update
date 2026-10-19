@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Pulls the latest vdev and installs anything new it needs.
+# Your team.json settings are kept.
+set -euo pipefail
+
+info() { printf '==> %s\n' "$1"; }
+fail() { printf 'Error: %s\n' "$1" >&2; exit 1; }
+
+cd "$(dirname "$0")/.."
+
+command -v git > /dev/null || fail "git is required."
+
+# Older versions tracked team.json, so a pull can try to change or remove it.
+# Set it aside for the pull and always put it back, even if the pull fails.
+team_config_backup=""
+restore_team_config() {
+  [ -n "$team_config_backup" ] || return 0
+  cp "$team_config_backup" team.json
+  rm -f "$team_config_backup"
+}
+trap restore_team_config EXIT
+
+if [ -f team.json ]; then
+  team_config_backup="$(mktemp)"
+  cp team.json "$team_config_backup"
+  if git ls-files --error-unmatch team.json > /dev/null 2>&1; then
+    git checkout -- team.json
+  fi
+fi
+
+if ! git diff --quiet HEAD; then
+  git status --short --untracked-files=no
+  fail "The files above have local changes, so vdev cannot update safely. Undo them (git checkout -- <file>) and run bin/update again."
+fi
+
+info "Pulling the latest vdev"
+git pull --ff-only
+
+restore_team_config
+team_config_backup=""
+
+bin/install
+
+echo
+info "Updated. If vdev is running, stop it (Ctrl+C in its terminal) and start it again with bin/server."

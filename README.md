@@ -13,6 +13,8 @@ bin/server
 
 Then open http://127.0.0.1:4321 and pick a workspace (a project folder under one of `workspaceRoots`).
 
+To get the latest version later, run `bin/update`, then restart `bin/server`. Your `team.json` settings are kept.
+
 `bin/install` installs [Bun](https://bun.sh) and the [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI if they are missing, then logs you in to Claude Code. It is safe to run again. On Linux it needs `curl` and `unzip`.
 
 Optional extras:
