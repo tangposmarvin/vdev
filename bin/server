@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Starts the vdev server. Set VDEV_PORT or VDEV_DATABASE to override team.json defaults.
+set -euo pipefail
+
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+
+if ! command -v bun > /dev/null; then
+  printf 'Error: bun not found. Run bin/install first.\n' >&2
+  exit 1
+fi
+
+if ! command -v claude > /dev/null; then
+  printf 'Error: claude not found. Run bin/install first.\n' >&2
+  exit 1
+fi
+
+if ! claude auth status 2> /dev/null | grep -q '"loggedIn": *true'; then
+  printf 'Error: Claude Code is not logged in. Run bin/install first.\n' >&2
+  exit 1
+fi
+
+cd "$(dirname "$0")/.."
+exec bun server.ts "$@"

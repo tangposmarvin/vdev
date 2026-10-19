@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Installs what vdev needs to run: Bun and the Claude Code CLI.
+# Supports macOS and Linux. Safe to run again; anything already installed is skipped.
+set -euo pipefail
+
+info() { printf '==> %s\n' "$1"; }
+fail() { printf 'Error: %s\n' "$1" >&2; exit 1; }
+
+case "$(uname -s)" in
+  Darwin | Linux) ;;
+  *) fail "vdev supports macOS and Linux only." ;;
+esac
+
+command -v curl > /dev/null || fail "curl is required. Install it with your package manager and run bin/install again."
+
+# The installers below put their binaries here, which may not be on PATH yet.
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+
+if command -v bun > /dev/null; then
+  info "Bun $(bun --version) already installed"
+else
+  if [ "$(uname -s)" = "Linux" ] && ! command -v unzip > /dev/null; then
+    fail "unzip is required to install Bun on Linux (e.g. sudo apt install unzip)."
+  fi
+  info "Installing Bun"
+  curl -fsSL https://bun.sh/install | bash
+fi
+
+if command -v claude > /dev/null; then
+  info "Claude Code $(claude --version) already installed"
+else
+  info "Installing Claude Code"
+  curl -fsSL https://claude.ai/install.sh | bash
+fi
+
+command -v bun > /dev/null || fail "Bun was installed but is not on PATH. Open a new shell and run bin/install again."
+command -v claude > /dev/null || fail "Claude Code was installed but is not on PATH. Open a new shell and run bin/install again."
+
+if claude auth status 2> /dev/null | grep -q '"loggedIn": *true'; then
+  info "Claude Code already logged in"
+else
+  info "Logging in to Claude Code"
+  claude auth login
+fi
+
+echo
+info "Done. Start vdev with: bin/server"
