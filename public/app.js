@@ -122,8 +122,8 @@ const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 
 // The main chat and the thread panel each keep their own message grouping.
 const views = {
-  main: { container: elements.messages, lastAuthor: null, lastMessageAt: 0, lastDay: null },
-  thread: { container: elements.threadMessages, lastAuthor: null, lastMessageAt: 0, lastDay: null },
+  main: { container: elements.messages, composer: mainComposer, lastAuthor: null, lastMessageAt: 0, lastDay: null },
+  thread: { container: elements.threadMessages, composer: threadComposer, lastAuthor: null, lastMessageAt: 0, lastDay: null },
 };
 
 function connect() {
@@ -1461,6 +1461,9 @@ function createComposer(form) {
     input: form.querySelector(".js-composer-input"),
     attachments: [],
     attachmentList: form.querySelector(".js-attachment-list"),
+    // { quote, comment, range } stacked from text selected in messages, sent with the next message
+    annotations: [],
+    annotationList: form.querySelector(".js-annotation-list"),
     error: form.querySelector(".js-composer-error"),
     fileInput: form.querySelector(".js-file-input"),
   };
@@ -1474,17 +1477,33 @@ function createComposer(form) {
     composer.error.hidden = true;
   };
   composer.addFiles = (files) => addFiles(composer, files);
-  composer.render = () => renderAttachments(composer);
+  composer.render = () => {
+    renderAttachments(composer);
+    renderAnnotations(composer);
+  };
+  composer.addAnnotation = (annotation) => {
+    composer.annotations.push(annotation);
+    annotationHighlight?.add(annotation.range);
+    composer.render();
+  };
+  composer.removeAnnotation = (index) => {
+    const [removed] = composer.annotations.splice(index, 1);
+    if (removed) annotationHighlight?.delete(removed.range);
+    composer.render();
+  };
   composer.clear = () => {
     composer.input.value = "";
     composer.hideError();
     for (const attachment of composer.attachments) if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
     composer.attachments = [];
+    for (const annotation of composer.annotations) annotationHighlight?.delete(annotation.range);
+    composer.annotations = [];
     composer.render();
   };
   // What the server needs: the preview URL stays in the browser.
   composer.payloadAttachments = () => composer.attachments.map(({ name, kind, mediaType, data }) => ({ name, kind, mediaType, data }));
-  composer.isEmpty = () => !composer.input.value.trim() && composer.attachments.length === 0;
+  composer.payloadText = (text) => textWithAnnotations(composer.annotations, text);
+  composer.isEmpty = () => !composer.input.value.trim() && composer.attachments.length === 0 && composer.annotations.length === 0;
 
   form.querySelector(".js-attach").addEventListener("click", () => composer.fileInput.click());
 
@@ -1524,6 +1543,11 @@ function createComposer(form) {
     const [removed] = composer.attachments.splice(Number(removeButton.dataset.index), 1);
     if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
     composer.render();
+  });
+
+  composer.annotationList.addEventListener("click", (clickEvent) => {
+    const removeButton = clickEvent.target.closest(".js-annotation-remove");
+    if (removeButton) composer.removeAnnotation(Number(removeButton.dataset.index));
   });
 
   return composer;
@@ -1612,6 +1636,160 @@ function formatBytes(bytes) {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   return bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} B`;
 }
+
+function renderAnnotations(composer) {
+  composer.annotationList.hidden = composer.annotations.length === 0;
+  composer.annotationList.replaceChildren(...composer.annotations.map((annotation, index) => {
+    const item = element("li", "annotation");
+    const text = element("div", "annotation-text");
+    text.append(element("q", "annotation-quote", annotation.quote), element("span", "annotation-comment", annotation.comment));
+    const removeButton = element("button", "attachment-remove js-annotation-remove", "x");
+    removeButton.type = "button";
+    removeButton.dataset.index = String(index);
+    removeButton.setAttribute("aria-label", "Remove comment");
+    item.append(text, removeButton);
+    return item;
+  }));
+}
+
+// Stacked comments go first, each as a quoted excerpt followed by the comment,
+// so the agent sees exactly which part of its reply each one is about.
+function textWithAnnotations(annotations, text) {
+  if (annotations.length === 0) return text;
+  const blocks = annotations.map(({ quote, comment }) => {
+    const quotedLines = quote.split("\n").map((line) => `> ${line}`).join("\n");
+    return `${quotedLines}\n${comment}`;
+  });
+  const intro = "Comments on parts of your reply (each quoted excerpt is followed by my comment):";
+  return [intro, ...blocks, text].filter(Boolean).join("\n\n");
+}
+
+// ---------------------------------------------------------------- annotations
+
+// Commented text stays highlighted in the message until it is sent or removed.
+// The highlight disappears if the message list is re-rendered; the comment stays.
+const annotationHighlight = window.Highlight && CSS.highlights ? new Highlight() : null;
+if (annotationHighlight) CSS.highlights.set("annotation", annotationHighlight);
+
+const annotatePopover = {
+  root: document.querySelector(".js-annotate-popover"),
+  startButton: document.querySelector(".js-annotate-start"),
+  form: document.querySelector(".js-annotate-form"),
+  quote: document.querySelector(".js-annotate-quote"),
+  input: document.querySelector(".js-annotate-input"),
+  cancelButton: document.querySelector(".js-annotate-cancel"),
+  // { quote, range, composer } of the selection being commented on
+  pending: null,
+};
+
+// Text selected inside one agent message (not your own) in the main chat or thread panel.
+function annotatableSelection() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+  const quote = selection.toString().trim();
+  if (!quote) return null;
+  const range = selection.getRangeAt(0);
+  const view = Object.values(views).find((candidate) => candidate.container.contains(range.commonAncestorContainer));
+  if (!view) return null;
+  const startMessage = closestElement(range.startContainer)?.closest(".message");
+  const endMessage = closestElement(range.endContainer)?.closest(".message");
+  if (!startMessage || startMessage !== endMessage || startMessage.classList.contains("message-user")) return null;
+  return { quote, range: range.cloneRange(), composer: view.composer };
+}
+
+function closestElement(node) {
+  return node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+}
+
+function showAnnotateButton(pending) {
+  annotatePopover.pending = pending;
+  annotatePopover.form.hidden = true;
+  annotatePopover.startButton.hidden = false;
+  annotatePopover.root.hidden = false;
+  positionAnnotatePopover();
+}
+
+function openAnnotateForm() {
+  const { pending } = annotatePopover;
+  if (!pending) return;
+  annotatePopover.quote.textContent = pending.quote;
+  annotatePopover.input.value = "";
+  annotatePopover.startButton.hidden = true;
+  annotatePopover.form.hidden = false;
+  positionAnnotatePopover();
+  annotatePopover.input.focus();
+}
+
+function hideAnnotatePopover() {
+  annotatePopover.pending = null;
+  annotatePopover.root.hidden = true;
+  annotatePopover.form.hidden = true;
+}
+
+function isAnnotateFormOpen() {
+  return !annotatePopover.root.hidden && !annotatePopover.form.hidden;
+}
+
+// Just below the end of the selection, kept inside the window.
+function positionAnnotatePopover() {
+  const rects = annotatePopover.pending.range.getClientRects();
+  const anchor = rects[rects.length - 1] ?? annotatePopover.pending.range.getBoundingClientRect();
+  const margin = 8;
+  const { offsetWidth: width, offsetHeight: height } = annotatePopover.root;
+  const left = Math.min(Math.max(margin, anchor.right - width), window.innerWidth - width - margin);
+  const below = anchor.bottom + margin;
+  const top = below + height > window.innerHeight - margin ? Math.max(margin, anchor.top - height - margin) : below;
+  annotatePopover.root.style.left = `${left}px`;
+  annotatePopover.root.style.top = `${top}px`;
+}
+
+document.addEventListener("mouseup", (mouseEvent) => {
+  if (annotatePopover.root.contains(mouseEvent.target)) return;
+  if (isAnnotateFormOpen()) return;
+  // The selection is final only after the browser handles the mouseup.
+  setTimeout(() => {
+    const pending = annotatableSelection();
+    if (pending) showAnnotateButton(pending);
+    else hideAnnotatePopover();
+  });
+});
+
+document.addEventListener("mousedown", (mouseEvent) => {
+  if (annotatePopover.root.hidden || annotatePopover.root.contains(mouseEvent.target)) return;
+  if (isAnnotateFormOpen() && annotatePopover.input.value.trim()) return;
+  hideAnnotatePopover();
+});
+
+for (const view of Object.values(views)) {
+  view.container.addEventListener("scroll", () => {
+    if (isAnnotateFormOpen()) positionAnnotatePopover();
+    else hideAnnotatePopover();
+  });
+}
+
+annotatePopover.startButton.addEventListener("click", openAnnotateForm);
+annotatePopover.cancelButton.addEventListener("click", hideAnnotatePopover);
+
+annotatePopover.input.addEventListener("keydown", (keyEvent) => {
+  if (keyEvent.key === "Escape") {
+    hideAnnotatePopover();
+    return;
+  }
+  if (keyEvent.key === "Enter" && !keyEvent.shiftKey && !keyEvent.isComposing) {
+    keyEvent.preventDefault();
+    annotatePopover.form.requestSubmit();
+  }
+});
+
+annotatePopover.form.addEventListener("submit", (submitEvent) => {
+  submitEvent.preventDefault();
+  const comment = annotatePopover.input.value.trim();
+  const { pending } = annotatePopover;
+  if (!comment || !pending) return;
+  pending.composer.addAnnotation({ quote: pending.quote, comment, range: pending.range });
+  hideAnnotatePopover();
+  window.getSelection()?.removeAllRanges();
+});
 
 // ---------------------------------------------------------------- input
 
@@ -1705,9 +1883,9 @@ elements.composer.addEventListener("submit", (submitEvent) => {
   state.lastComposer = mainComposer;
   const directMention = text.match(/^@(\S+)\s+([\s\S]+)/);
   if (directMention && state.members.has(directMention[1])) {
-    send({ type: "send", member: directMention[1], text: directMention[2], attachments });
+    send({ type: "send", member: directMention[1], text: mainComposer.payloadText(directMention[2]), attachments });
   } else {
-    send({ type: "send", member: state.selected, text, attachments });
+    send({ type: "send", member: state.selected, text: mainComposer.payloadText(text), attachments });
   }
   mainComposer.clear();
 });
@@ -1751,7 +1929,7 @@ elements.threadComposer.addEventListener("submit", (submitEvent) => {
   if (threadComposer.isEmpty() || !thread) return;
   const target = thread.itemId !== null ? { itemId: thread.itemId } : { threadId: thread.rootId };
   state.lastComposer = threadComposer;
-  send({ type: "send", member: thread.member, text: threadComposer.input.value.trim(), attachments: threadComposer.payloadAttachments(), ...target });
+  send({ type: "send", member: thread.member, text: threadComposer.payloadText(threadComposer.input.value.trim()), attachments: threadComposer.payloadAttachments(), ...target });
   threadComposer.clear();
 });
 

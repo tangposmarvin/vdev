@@ -246,10 +246,23 @@
       </form>
     </main>
   </div>
+  <!-- Shown next to text selected in a message: comments stack in that view's composer until you send. -->
+  <div class="annotate-popover js-annotate-popover" hidden>
+    <button type="button" class="button button-small js-annotate-start">Comment</button>
+    <form class="annotate-form js-annotate-form" hidden>
+      <blockquote class="annotate-quote js-annotate-quote"></blockquote>
+      <textarea class="form-input annotate-input js-annotate-input" rows="3" placeholder="What should change?"></textarea>
+      <div class="annotate-actions">
+        <button type="button" class="button button-small js-annotate-cancel">Cancel</button>
+        <button type="submit" class="button button-small button-primary">Add comment</button>
+      </div>
+    </form>
+  </div>
   <!-- Shared markup for every message box; app.js fills each .composer form from it. -->
   <template class="js-composer-template">
     <p class="composer-error js-composer-error" hidden></p>
     <div class="composer-box">
+      <ul class="annotation-list js-annotation-list" hidden></ul>
       <ul class="attachment-list js-attachment-list" hidden></ul>
       <textarea class="composer-input js-composer-input" rows="1"></textarea>
       <div class="composer-toolbar">

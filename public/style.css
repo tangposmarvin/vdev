@@ -27,6 +27,7 @@
 
   --mention: #cd2553;
   --task-tint: #fdf6e3;
+  --annotation-tint: rgba(232, 163, 61, 0.35);
   --task-bar: #e8a33d;
   --handoff-tint: #ecf7f1;
   --handoff-bar: #2bac76;
@@ -80,6 +81,7 @@
     --sidebar-input-bg: #222026;
     --mention: #cd2553;
     --task-tint: #2a2417;
+    --annotation-tint: rgba(232, 163, 61, 0.3);
     --task-bar: #e8a33d;
     --handoff-tint: #16271f;
     --handoff-bar: #2bac76;
@@ -120,6 +122,7 @@
   --sidebar-input-bg: #222026;
   --mention: #cd2553;
   --task-tint: #2a2417;
+  --annotation-tint: rgba(232, 163, 61, 0.3);
   --task-bar: #e8a33d;
   --handoff-tint: #16271f;
   --handoff-bar: #2bac76;
@@ -1168,6 +1171,57 @@ button { font: inherit; color: inherit; }
 }
 
 .attachment-remove:hover { background: var(--border); color: var(--error); }
+
+/* ---------------------------------------------------------------- annotations */
+
+::highlight(annotation) { background-color: var(--annotation-tint); }
+
+.annotation-list { display: flex; flex-direction: column; gap: 6px; max-height: 180px; margin: 0; padding: 10px 10px 0; overflow-y: auto; list-style: none; }
+
+.annotation {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 4px 4px 8px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--task-bar);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  font-size: 12px;
+}
+
+.annotation-text { display: flex; flex: 1; flex-direction: column; gap: 2px; min-width: 0; }
+.annotation-quote { overflow: hidden; color: var(--text-muted); font-style: italic; text-overflow: ellipsis; white-space: nowrap; }
+.annotation-comment { overflow-wrap: anywhere; white-space: pre-wrap; }
+
+.annotate-popover {
+  position: fixed;
+  z-index: 50;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.annotate-popover[hidden], .annotate-form[hidden] { display: none; }
+.annotate-form { display: flex; flex-direction: column; gap: 6px; width: min(340px, calc(100vw - 32px)); padding: 4px; }
+
+.annotate-quote {
+  display: -webkit-box;
+  margin: 0;
+  padding-left: 8px;
+  overflow: hidden;
+  border-left: 3px solid var(--task-bar);
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: pre-wrap;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.annotate-input { resize: vertical; }
+.annotate-actions { display: flex; justify-content: flex-end; gap: 6px; }
 
 /* ---------------------------------------------------------------- dialogs and forms */
 
