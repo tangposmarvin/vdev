@@ -20,4 +20,5 @@ if ! claude auth status 2> /dev/null | grep -q '"loggedIn": *true'; then
 fi
 
 cd "$(dirname "$0")/.."
+[ -f team.json ] || cp team.example.json team.json
 exec bun server.ts "$@"

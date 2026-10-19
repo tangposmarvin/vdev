@@ -43,5 +43,13 @@ else
   claude auth login
 fi
 
+cd "$(dirname "$0")/.."
+if [ -f team.json ]; then
+  info "team.json already exists"
+else
+  info "Creating team.json from team.example.json"
+  cp team.example.json team.json
+fi
+
 echo
 info "Done. Start vdev with: bin/server"

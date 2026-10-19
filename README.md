@@ -22,7 +22,7 @@ Optional extras:
 
 ## Configuration
 
-Edit `team.json`:
+Settings live in `team.json`, which is created from `team.example.json` on first run and is not tracked by git, so your changes (including those made in the UI) stay local. Edit `team.example.json` only to change the defaults for everyone.
 
 | Key | Purpose |
 |---|---|

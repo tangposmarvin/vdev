@@ -6,3 +6,6 @@ vdev.sqlite-*
 .playwright-mcp/
 
 .DS_Store
+
+# Local team config (copied from team.example.json by bin/install)
+team.json
