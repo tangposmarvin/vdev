@@ -2931,12 +2931,17 @@ function clientVersion(): string {
   return Bun.hash(contents.join("\n")).toString(36);
 }
 
+// Browsers let any website open a websocket to 127.0.0.1, so only vdev's own page
+// may connect; otherwise a page the user visits could drive the team.
+const allowedSocketOrigins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
+
 const server = Bun.serve({
   hostname: "127.0.0.1",
   port,
   async fetch(request, bunServer) {
     const url = new URL(request.url);
     if (url.pathname === "/ws") {
+      if (!allowedSocketOrigins.has(request.headers.get("origin") ?? "")) return new Response("Forbidden", { status: 403 });
       if (bunServer.upgrade(request)) return undefined;
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
