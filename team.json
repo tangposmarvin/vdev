@@ -16,7 +16,7 @@
   },
   "worker": {
     "budget": 500000,
-    "chrome": true,
+    "chrome": false,
     "allowedTools": [
       "Read",
       "Edit",

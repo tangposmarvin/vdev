@@ -33,7 +33,7 @@ Edit `team.json`:
 | `worker` | Shared settings for every worker (model, effort, budget, allowed tools, `chrome`) |
 | `workers` | Worker names |
 
-If your account does not have Chrome integration set up, set `worker.chrome` to `false`. The model IDs in `team.json` must be available on your plan.
+`worker.chrome` is off by default. Set it to `true` to let workers drive Chrome through the Claude in Chrome extension. The model IDs in `team.json` must be available on your plan.
 
 Environment variables (e.g. `VDEV_PORT=5000 bin/server`):
 
